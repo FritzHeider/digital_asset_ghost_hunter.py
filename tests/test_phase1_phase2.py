@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 import phase1_smart_discovery
 import phase2_dead_link_detection
 
@@ -31,6 +33,44 @@ class Phase1PaginationTest(unittest.TestCase):
             )
 
         self.assertEqual(channel_ids, ["a", "b"])
+
+    def test_recent_upload_403_keeps_channel_eligible(self) -> None:
+        response = requests.Response()
+        response.status_code = 403
+        response._content = b'{"error":{"message":"Forbidden","errors":[{"reason":"forbidden"}]}}'
+        error = requests.HTTPError("403 Client Error: Forbidden")
+        error.response = response
+
+        with (
+            mock.patch("phase1_smart_discovery.youtube_get", side_effect=error),
+            self.assertLogs("phase1_smart_discovery", level="WARNING"),
+        ):
+            self.assertFalse(
+                phase1_smart_discovery._has_recent_upload(
+                    mock.Mock(),
+                    api_key="key",
+                    channel_id="channel1",
+                    recent_days=180,
+                )
+            )
+
+    def test_recent_upload_quota_403_remains_fatal(self) -> None:
+        response = requests.Response()
+        response.status_code = 403
+        response._content = (
+            b'{"error":{"message":"Quota exceeded","errors":[{"reason":"quotaExceeded"}]}}'
+        )
+        error = requests.HTTPError("403 Client Error: Forbidden")
+        error.response = response
+
+        with mock.patch("phase1_smart_discovery.youtube_get", side_effect=error):
+            with self.assertRaises(requests.HTTPError):
+                phase1_smart_discovery._has_recent_upload(
+                    mock.Mock(),
+                    api_key="key",
+                    channel_id="channel1",
+                    recent_days=180,
+                )
 
 
 class Phase2DryRunTest(unittest.TestCase):

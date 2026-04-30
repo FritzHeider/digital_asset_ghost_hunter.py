@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
+import requests
+
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -30,6 +32,15 @@ from cashtube_utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+FATAL_YOUTUBE_403_REASONS = {
+    "accessNotConfigured",
+    "dailyLimitExceeded",
+    "ipRefererBlocked",
+    "keyInvalid",
+    "quotaExceeded",
+    "rateLimitExceeded",
+}
 
 
 @dataclass
@@ -94,20 +105,51 @@ def _has_recent_upload(
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
     published_after = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
-    data = youtube_get(
-        session,
-        "search",
-        {
-            "part": "id",
-            "type": "video",
-            "channelId": channel_id,
-            "publishedAfter": published_after,
-            "maxResults": 1,
-            "key": api_key,
-        },
-        rate_limiter=rate_limiter,
-    )
+    try:
+        data = youtube_get(
+            session,
+            "search",
+            {
+                "part": "id",
+                "type": "video",
+                "channelId": channel_id,
+                "publishedAfter": published_after,
+                "maxResults": 1,
+                "key": api_key,
+            },
+            rate_limiter=rate_limiter,
+        )
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is None or response.status_code != 403:
+            raise
+
+        reason, message = _youtube_error_details(response)
+        if reason in FATAL_YOUTUBE_403_REASONS:
+            raise
+
+        LOGGER.warning(
+            "Could not check recent uploads for channel %s due to YouTube 403%s; keeping channel eligible",
+            channel_id,
+            f" ({reason}: {message})" if reason or message else "",
+        )
+        return False
     return bool(data.get("items"))
+
+
+def _youtube_error_details(response: requests.Response) -> tuple[str, str]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return "", ""
+
+    error = payload.get("error", {})
+    message = str(error.get("message", ""))
+    errors = error.get("errors", [])
+    if errors:
+        first_error = errors[0]
+        return str(first_error.get("reason", "")), message
+    return "", message
 
 
 def _load_seen_channel_ids(path: str | None) -> set[str]:
