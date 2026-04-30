@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
 import socket
 import sqlite3
 import sys
+import threading
 import time
 from collections import Counter
 import csv
@@ -89,6 +91,47 @@ def configure_logging(json_logs: bool = False, level: str = "INFO") -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
+def configure_dns_timeout(seconds: float = 5.0) -> None:
+    """Set the global socket timeout used by all DNS resolution calls.
+
+    Call once from each main() before spawning any threads.  Setting it once
+    (rather than per-call inside classify_domain) avoids race conditions when
+    multiple threads share the same global timeout.
+    """
+    socket.setdefaulttimeout(seconds)
+
+
+def prompt_for_keywords() -> list[str]:
+    """Interactively ask the operator for search keywords.
+
+    Exits with a clear error if stdin is not a TTY (non-interactive context).
+    """
+    if not sys.stdin.isatty():
+        sys.exit(
+            "No keywords provided. Pass --keywords 'term1,term2' or "
+            "--keywords-file config.json when running non-interactively."
+        )
+    print("No keywords specified. Enter YouTube search terms for channel discovery.")
+    print("Examples: 'tech review', 'kickstarter gadget', 'saas tutorial 2015'")
+    print("One keyword per line. Press Enter on an empty line when done.\n")
+    keywords: list[str] = []
+    while True:
+        try:
+            line = input(f"  keyword {len(keywords) + 1}> ").strip()
+        except EOFError:
+            break
+        if not line:
+            if keywords:
+                break
+            print("  (enter at least one keyword)")
+            continue
+        keywords.append(line)
+    if not keywords:
+        sys.exit("No keywords entered. Exiting.")
+    print(f"\nUsing {len(keywords)} keyword(s): {', '.join(keywords)}\n")
+    return keywords
 
 
 def make_session() -> requests.Session:
@@ -226,9 +269,10 @@ class SQLiteCache:
     def __init__(self, path: str | None, ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS) -> None:
         self.path = path
         self.ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         if path:
-            self._conn = sqlite3.connect(path)
+            self._conn = sqlite3.connect(path, check_same_thread=False)
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS cache (namespace TEXT, key TEXT, value TEXT, updated_at REAL, PRIMARY KEY (namespace, key))"
             )
@@ -237,10 +281,11 @@ class SQLiteCache:
     def get(self, namespace: str, key: str) -> dict[str, Any] | None:
         if not self._conn:
             return None
-        row = self._conn.execute(
-            "SELECT value, updated_at FROM cache WHERE namespace = ? AND key = ?",
-            (namespace, key),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value, updated_at FROM cache WHERE namespace = ? AND key = ?",
+                (namespace, key),
+            ).fetchone()
         if not row:
             return None
         value, updated_at = row
@@ -251,15 +296,17 @@ class SQLiteCache:
     def set(self, namespace: str, key: str, value: dict[str, Any]) -> None:
         if not self._conn:
             return
-        self._conn.execute(
-            "INSERT OR REPLACE INTO cache (namespace, key, value, updated_at) VALUES (?, ?, ?, ?)",
-            (namespace, key, json.dumps(value, default=str, sort_keys=True), time.time()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO cache (namespace, key, value, updated_at) VALUES (?, ?, ?, ?)",
+                (namespace, key, json.dumps(value, default=str, sort_keys=True), time.time()),
+            )
+            self._conn.commit()
 
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
+        with self._lock:
+            if self._conn:
+                self._conn.close()
 
 
 def extract_urls(text: str) -> list[str]:
@@ -314,11 +361,16 @@ class DomainCheck:
 
 
 def classify_domain(domain: str, timeout: float = 5.0) -> DomainCheck:
+    """Resolve domain via DNS and classify the result.
+
+    Uses the global socket timeout (set once at startup via configure_dns_timeout)
+    rather than mutating it per-call, which is not thread-safe.  The ``timeout``
+    parameter is accepted for API compatibility but ignored; call
+    configure_dns_timeout() from main() before spawning threads instead.
+    """
     if not domain:
         return DomainCheck(domain=domain, status=DnsStatus.TEMPORARY_ERROR)
 
-    original_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
     try:
         socket.getaddrinfo(domain, None)
         return DomainCheck(domain=domain, status=DnsStatus.LIVE)
@@ -333,8 +385,6 @@ def classify_domain(domain: str, timeout: float = 5.0) -> DomainCheck:
         return DomainCheck(domain=domain, status=DnsStatus.TIMEOUT)
     except OSError:
         return DomainCheck(domain=domain, status=DnsStatus.TEMPORARY_ERROR)
-    finally:
-        socket.setdefaulttimeout(original_timeout)
 
 
 def utc_now_iso() -> str:
@@ -396,7 +446,7 @@ def rdap_lookup(session: requests.Session, domain: str, timeout: int = DEFAULT_T
 def wayback_lookup(session: requests.Session, domain: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     try:
         response = session.get(
-            "https://web.archive.org/cdx",
+            "https://web.archive.org/cdx/search/cdx",
             params={"url": domain, "output": "json", "limit": 1},
             timeout=timeout,
         )
@@ -425,3 +475,54 @@ def trademark_risk(session: requests.Session, word: str, timeout: int = DEFAULT_
         return "risky" if response.json().get("count", 0) > 0 else "clear"
     except requests.RequestException:
         return "error"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers (shared by pipeline and phase2 standalone)
+# ---------------------------------------------------------------------------
+
+def load_checkpoint(path: str | None) -> set[str]:
+    if not path or not Path(path).exists():
+        return set()
+    try:
+        return set(json.loads(Path(path).read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        logging.getLogger(__name__).warning(
+            "Could not read checkpoint %s; starting fresh", path
+        )
+        return set()
+
+
+def save_checkpoint(path: str | None, items: set[str]) -> None:
+    if path:
+        Path(path).write_text(json.dumps(sorted(items), indent=2) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Priority scoring
+# ---------------------------------------------------------------------------
+
+def compute_priority_score(
+    rdap_status: str,
+    wayback_status: str,
+    trademark_status: str,
+    parking_detected: bool,
+) -> int:
+    """Score a dead-domain candidate.
+
+    Scoring rubric:
+      +2  rdap not_found          (unregistered — available to acquire)
+      +1  wayback snapshot_found  (had real content — carries SEO equity)
+      -1  parking_detected        (parked domains have lower acquisition priority)
+      -2  trademark risky         (legal risk)
+    """
+    score = 0
+    if rdap_status == "not_found":
+        score += 2
+    if wayback_status == "snapshot_found":
+        score += 1
+    if parking_detected:
+        score -= 1
+    if trademark_status == "risky":
+        score -= 2
+    return score

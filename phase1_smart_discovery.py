@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import requests
 
@@ -21,12 +22,16 @@ except ImportError:
 from cashtube_utils import (
     RateLimiter,
     chunked,
+    configure_dns_timeout,
     configure_logging,
+    load_checkpoint,
     load_config,
     make_session,
+    prompt_for_keywords,
+    save_checkpoint,
     validate_published_before,
-    write_json,
     write_dicts_to_csv,
+    write_json,
     write_markdown_report,
     youtube_get,
 )
@@ -50,23 +55,25 @@ class ChannelRecord:
     view_count: int
     video_count: int
     published_at: str
+    last_upload: str = ""
     source_keyword: str = ""
 
 
 def _search_legacy_video_channels(
+    session: requests.Session,
     api_key: str,
     query: str,
     published_before: str,
+    published_after: str | None,
     max_channels: int,
     rate_limiter: RateLimiter | None = None,
 ) -> list[str]:
-    session = make_session()
     channel_ids: list[str] = []
     seen: set[str] = set()
     page_token: str | None = None
 
     while len(channel_ids) < max_channels:
-        params = {
+        params: dict = {
             "part": "snippet",
             "type": "video",
             "publishedBefore": published_before,
@@ -74,6 +81,8 @@ def _search_legacy_video_channels(
             "maxResults": 50,
             "key": api_key,
         }
+        if published_after:
+            params["publishedAfter"] = published_after
         if page_token:
             params["pageToken"] = page_token
 
@@ -94,14 +103,21 @@ def _search_legacy_video_channels(
 
 
 def _has_recent_upload(
-    session,
+    session: requests.Session,
     api_key: str,
     channel_id: str,
     recent_days: int,
     rate_limiter: RateLimiter | None = None,
-) -> bool:
+) -> Optional[str]:
+    """Return the most recent upload date (ISO string) if the channel uploaded
+    within ``recent_days``, or None if it has not.
+
+    A non-fatal YouTube 403 (e.g. restricted channel) returns None — the
+    channel is treated as having no recent uploads and stays eligible.
+    A fatal 403 (quota, bad key) re-raises so the caller can abort.
+    """
     if recent_days <= 0:
-        return False
+        return None
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
     published_after = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -110,7 +126,7 @@ def _has_recent_upload(
             session,
             "search",
             {
-                "part": "id",
+                "part": "snippet",
                 "type": "video",
                 "channelId": channel_id,
                 "publishedAfter": published_after,
@@ -133,8 +149,12 @@ def _has_recent_upload(
             channel_id,
             f" ({reason}: {message})" if reason or message else "",
         )
-        return False
-    return bool(data.get("items"))
+        return None
+
+    items = data.get("items", [])
+    if not items:
+        return None
+    return items[0].get("snippet", {}).get("publishedAt", "")
 
 
 def _youtube_error_details(response: requests.Response) -> tuple[str, str]:
@@ -152,22 +172,6 @@ def _youtube_error_details(response: requests.Response) -> tuple[str, str]:
     return "", message
 
 
-def _load_seen_channel_ids(path: str | None) -> set[str]:
-    if not path or not Path(path).exists():
-        return set()
-    try:
-        return set(json.loads(Path(path).read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        LOGGER.warning("Could not read channel checkpoint %s; starting fresh", path)
-        return set()
-
-
-def _save_seen_channel_ids(path: str | None, channel_ids: set[str]) -> None:
-    if not path:
-        return
-    Path(path).write_text(json.dumps(sorted(channel_ids), indent=2) + "\n", encoding="utf-8")
-
-
 def discover_channels(
     api_key: str,
     published_before: str,
@@ -177,90 +181,100 @@ def discover_channels(
     min_views: int = 0,
     keywords: str | None = None,
     keyword_list: list[str] | None = None,
+    published_after: str | None = None,
     checkpoint_file: str | None = None,
     youtube_delay: float = 0.0,
 ) -> List[ChannelRecord]:
-    """
-    Search for legacy videos, then qualify their parent channels.
+    """Search for legacy videos, then qualify their parent channels.
 
-    recent_days excludes channels that uploaded recently; pass 0 to disable that
-    inactivity filter.
+    ``recent_days`` skips channels that uploaded recently; pass 0 to disable.
+    Raises ValueError when no keywords are provided.
     """
     validate_published_before(published_before)
-    queries = keyword_list or ([keywords] if keywords else ["pokemon cards"])
+
+    queries = keyword_list or ([keywords] if keywords else None)
+    if not queries:
+        raise ValueError(
+            "At least one keyword is required. Pass --keywords or --keywords-file."
+        )
+
     rate_limiter = RateLimiter(youtube_delay)
-    seen_channel_ids = _load_seen_channel_ids(checkpoint_file)
-    newly_seen = set(seen_channel_ids)
+    seen_channel_ids = load_checkpoint(checkpoint_file)
+    session = make_session()
 
-    try:
-        candidates_by_keyword: dict[str, str] = {}
-        for query in queries:
-            LOGGER.info("Searching legacy videos matching %r", query)
-            candidate_ids = _search_legacy_video_channels(
-                api_key=api_key,
-                query=query,
-                published_before=published_before,
-                max_channels=max(max_channels * 3, 50),
-                rate_limiter=rate_limiter,
+    candidates_by_keyword: dict[str, str] = {}
+    for query in queries:
+        LOGGER.info("Searching legacy videos matching %r", query)
+        candidate_ids = _search_legacy_video_channels(
+            session=session,
+            api_key=api_key,
+            query=query,
+            published_before=published_before,
+            published_after=published_after,
+            max_channels=max(max_channels * 3, 50),
+            rate_limiter=rate_limiter,
+        )
+        for channel_id in candidate_ids:
+            if channel_id not in seen_channel_ids:
+                candidates_by_keyword.setdefault(channel_id, query)
+
+    candidate_ids = list(candidates_by_keyword)
+    if not candidate_ids:
+        LOGGER.warning("No new channels found in search results")
+        return []
+
+    LOGGER.info("Found %s candidate channels; fetching statistics", len(candidate_ids))
+    results: list[ChannelRecord] = []
+    for batch in chunked(candidate_ids, 50):
+        data = youtube_get(
+            session,
+            "channels",
+            {
+                "part": "snippet,statistics",
+                "id": ",".join(batch),
+                "key": api_key,
+            },
+            rate_limiter=rate_limiter,
+        )
+        for item in data.get("items", []):
+            stats = item.get("statistics", {})
+            video_count = int(stats.get("videoCount", 0))
+            view_count = int(stats.get("viewCount", 0))
+            if video_count < min_video_count or view_count < min_views:
+                continue
+
+            last_upload = _has_recent_upload(
+                session, api_key, item["id"], recent_days, rate_limiter
             )
-            for channel_id in candidate_ids:
-                if channel_id not in seen_channel_ids:
-                    candidates_by_keyword.setdefault(channel_id, query)
-                newly_seen.add(channel_id)
+            if last_upload is not None:
+                # Channel uploaded recently — still active, not a ghost target
+                continue
 
-        candidate_ids = list(candidates_by_keyword)
-        if not candidate_ids:
-            LOGGER.warning("No channels found in search results")
-            _save_seen_channel_ids(checkpoint_file, newly_seen)
-            return []
-
-        LOGGER.info("Found %s potential channels; fetching statistics", len(candidate_ids))
-        session = make_session()
-        results: list[ChannelRecord] = []
-        for batch in chunked(candidate_ids, 50):
-            data = youtube_get(
-                session,
-                "channels",
-                {
-                    "part": "snippet,statistics",
-                    "id": ",".join(batch),
-                    "key": api_key,
-                },
-                rate_limiter=rate_limiter,
-            )
-            for item in data.get("items", []):
-                stats = item.get("statistics", {})
-                video_count = int(stats.get("videoCount", 0))
-                view_count = int(stats.get("viewCount", 0))
-                if video_count < min_video_count or view_count < min_views:
-                    continue
-                if _has_recent_upload(session, api_key, item["id"], recent_days, rate_limiter):
-                    continue
-
-                results.append(
-                    ChannelRecord(
-                        channel_id=item["id"],
-                        title=item.get("snippet", {}).get("title", ""),
-                        view_count=view_count,
-                        video_count=video_count,
-                        published_at=item.get("snippet", {}).get("publishedAt", ""),
-                        source_keyword=candidates_by_keyword.get(item["id"], ""),
-                    )
+            results.append(
+                ChannelRecord(
+                    channel_id=item["id"],
+                    title=item.get("snippet", {}).get("title", ""),
+                    view_count=view_count,
+                    video_count=video_count,
+                    published_at=item.get("snippet", {}).get("publishedAt", ""),
+                    last_upload=last_upload or "",
+                    source_keyword=candidates_by_keyword.get(item["id"], ""),
                 )
-                if len(results) >= max_channels:
-                    break
+            )
             if len(results) >= max_channels:
                 break
+        if len(results) >= max_channels:
+            break
 
-        _save_seen_channel_ids(checkpoint_file, newly_seen)
-        return sorted(results, key=lambda c: (-c.view_count, c.title.lower(), c.channel_id))
-    except Exception:
-        LOGGER.exception("Discovery failed")
-        return []
+    # Checkpoint tracks only channels that were fully qualified and processed
+    qualified_ids = seen_channel_ids | {r.channel_id for r in results}
+    save_checkpoint(checkpoint_file, qualified_ids)
+
+    return sorted(results, key=lambda c: (-c.view_count, c.title.lower(), c.channel_id))
 
 
 def write_channels_to_csv(channels: List[ChannelRecord], output_file: str) -> None:
-    fieldnames = list(ChannelRecord("", "", 0, 0, "").__dict__.keys())
+    fieldnames = [f.name for f in dataclasses.fields(ChannelRecord)]
     write_dicts_to_csv([asdict(channel) for channel in channels], output_file, fieldnames)
 
 
@@ -269,6 +283,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cashtube Phase 1: Smart Discovery")
     parser.add_argument("--api-key", help="YouTube Data API key")
     parser.add_argument("--published-before", default="2016-01-01T00:00:00Z")
+    parser.add_argument("--published-after", default=None,
+                        help="Narrow to channels created after this ISO-8601 date")
     parser.add_argument("--min-video-count", type=int, default=50)
     parser.add_argument("--recent-days", type=int, default=180)
     parser.add_argument("--max-channels", type=int, default=100)
@@ -280,14 +296,18 @@ def main() -> None:
     parser.add_argument("--report-output", default=None)
     parser.add_argument("--checkpoint-file", default=".cashtube_channels_seen.json")
     parser.add_argument("--youtube-delay", type=float, default=0.0)
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
-    configure_logging(json_logs=args.json_logs)
+    configure_logging(json_logs=args.json_logs, level=args.log_level)
+    configure_dns_timeout()
 
-    try:
-        validate_published_before(args.published_before)
-    except ValueError as exc:
-        parser.error(str(exc))
+    for date_arg in filter(None, [args.published_before, args.published_after]):
+        try:
+            validate_published_before(date_arg)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     api_key = args.api_key or os.getenv("YOUTUBE_API_KEY")
     if not api_key:
@@ -295,10 +315,15 @@ def main() -> None:
 
     config = load_config(args.keywords_file)
     keyword_list = config.get("keywords") if config else None
+
+    if not keyword_list and not args.keywords:
+        keyword_list = prompt_for_keywords()
+
     start = time.time()
     channels = discover_channels(
         api_key=api_key,
         published_before=args.published_before,
+        published_after=args.published_after,
         min_video_count=args.min_video_count,
         recent_days=args.recent_days,
         max_channels=args.max_channels,
