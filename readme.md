@@ -182,7 +182,7 @@ python phase2_dead_link_detection.py \
 
 ## Run Full Pipeline
 ```bash
-python cashtube_pipeline.py \
+cashtube pipeline \
     --api-key YOUR_API_KEY \
     --published-before 2016-01-01T00:00:00Z \
     --min-video-count 50 \
@@ -191,6 +191,58 @@ python cashtube_pipeline.py \
     --top-n-videos 20 \
     --channels-output phase1_results.csv \
     --dead-links-output phase2_results.csv
+```
+
+## Dry Run and Structured Logs
+Use `--dry-run` to extract candidate domains without DNS checks. Use
+`--json-logs` when piping logs into a collector.
+
+```bash
+cashtube pipeline \
+    --api-key YOUR_API_KEY \
+    --dry-run \
+    --json-logs \
+    --json-output phase2_results.json \
+    --report-output phase2_summary.md
+```
+
+## Config Files
+Keywords, ignored domains, and allowed TLDs can be loaded from JSON or YAML.
+
+```json
+{
+  "keywords": ["tech review", "unboxing", "kickstarter gadget"],
+  "ignore_domains": ["youtube.com", "amazon.com"],
+  "allowed_tlds": [".com", ".io", ".net"]
+}
+```
+
+```bash
+cashtube pipeline \
+    --api-key YOUR_API_KEY \
+    --keywords-file cashtube-config.json \
+    --config cashtube-config.json \
+    --include-domain example.com \
+    --exclude-domain youtube.com \
+    --cache-db .cashtube_cache.sqlite3 \
+    --cache-ttl-seconds 86400
+```
+
+## Phase 2 Enrichment
+Optional checks can annotate DNS candidates with HTTP/SSL, parking-page,
+RDAP, Wayback, and trademark risk signals. Trademark checks use
+`USPTO_API_KEY` from the environment.
+
+```bash
+cashtube phase2 \
+    --channels-file phase1_results.csv \
+    --enrich-http \
+    --check-rdap \
+    --check-wayback \
+    --check-trademark \
+    --channel-timeout 120 \
+    --yt-dlp-delay 1 \
+    --yt-dlp-retries 3
 ```
 
 ---
