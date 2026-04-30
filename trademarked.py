@@ -1,33 +1,14 @@
-import requests
+from __future__ import annotations
 
-def is_trademarked(word):
-    """
-    Checks the USPTO API to see if a word has an active trademark.
-    Note: Requires a USPTO API Key from developer.uspto.gov
-    """
-    # USPTO TSDR API Endpoint (2026 Standard)
-    api_url = f"https://developer.uspto.gov/api-catalog/tsdr-data-api/v1/search"
-    
-    headers = {
-        "Accept": "application/json",
-        "Authorization": "Bearer YOUR_USPTO_API_KEY"
-    }
-    
-    # Query for the literal word in active trademarks
-    params = {
-        "q": f"mark_literal_text:{word} AND registration_date:[* TO *]",
-        "rows": 1
-    }
+from cashtube_utils import make_session, trademark_risk
 
-    try:
-        response = requests.get(api_url, headers=headers, params=params, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        # If any results come back, it's a potential risk
-        if data.get('count', 0) > 0:
-            return True
-        return False
-    except Exception as e:
-        print(f"Trademark check failed: {e}")
-        return True # Default to True (risky) if API fails
+
+def is_trademarked(word: str) -> bool:
+    """Return True if the word has a registered trademark (USPTO).
+
+    Requires USPTO_API_KEY in the environment.  Returns True (risky) when the
+    API is not configured or the request fails, to default toward caution.
+    """
+    session = make_session()
+    result = trademark_risk(session, word)
+    return result in ("risky", "error", "not_configured")

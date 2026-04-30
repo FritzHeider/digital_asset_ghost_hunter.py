@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import dataclasses
 import json
 import logging
 import time
@@ -16,15 +17,19 @@ from cashtube_utils import (
     SQLiteCache,
     check_http_domain,
     classify_domain,
+    compute_priority_score,
+    configure_dns_timeout,
     configure_logging,
     extract_urls,
     get_domain,
     is_interesting_domain,
+    load_checkpoint,
     load_config,
     make_session,
     normalize_tlds,
     parse_csv_set,
     rdap_lookup,
+    save_checkpoint,
     trademark_risk,
     utc_now_iso,
     wayback_lookup,
@@ -50,6 +55,7 @@ class DeadLinkEntry:
     rdap_status: str
     wayback_status: str
     trademark_status: str
+    priority_score: int
     first_seen_at: str
     source_description_snippet: str
 
@@ -111,17 +117,22 @@ def process_channel(
             try:
                 if yt_dlp_delay:
                     time.sleep(yt_dlp_delay)
+                # Check again after the delay so a long sleep doesn't push past deadline
+                if timed_out():
+                    raise TimeoutError(f"Timed out scanning {channel_url}")
                 info = ydl.extract_info(url, download=False)
                 if cache:
                     cache.set("video_metadata", url, info)
                 return info
+            except TimeoutError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 time.sleep(min(2**attempt, 8))
         raise RuntimeError(f"yt-dlp failed after {yt_dlp_retries} attempts") from last_exc
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = extract_info(ydl, f"{channel_url}/videos?view=0&sort=p")
             videos = info.get("entries", [])[:top_n_videos]
 
@@ -148,8 +159,10 @@ def process_channel(
                             "video_url": video_url,
                             "source_description_snippet": _snippet(description, url),
                         }
-        except Exception:
-            LOGGER.exception("yt-dlp failed while scanning %s", channel_url)
+    except TimeoutError:
+        LOGGER.warning("Channel scan timed out for %s", channel_url)
+    except Exception:
+        LOGGER.exception("yt-dlp failed while scanning %s", channel_url)
 
     if dry_run:
         return [
@@ -166,6 +179,7 @@ def process_channel(
                 rdap_status="unchecked",
                 wayback_status="unchecked",
                 trademark_status="unchecked",
+                priority_score=0,
                 first_seen_at=utc_now_iso(),
                 source_description_snippet=meta["source_description_snippet"],
             )
@@ -199,6 +213,8 @@ def process_channel(
         trademark_status = (
             trademark_risk(session, domain.split(".", 1)[0]) if check_trademark else "unchecked"
         )
+        parking = http_check.parked if http_check else False
+        score = compute_priority_score(rdap_status, wayback_status, trademark_status, parking)
         results.append(
             DeadLinkEntry(
                 channel_url=channel_url,
@@ -208,11 +224,12 @@ def process_channel(
                 error_category="dns_nxdomain",
                 http_status=http_check.http_status if http_check else None,
                 ssl_ok=http_check.ssl_ok if http_check else None,
-                parking_detected=http_check.parked if http_check else False,
+                parking_detected=parking,
                 availability_signal=http_check.signal if http_check else "dns_nxdomain",
                 rdap_status=rdap_status,
                 wayback_status=wayback_status,
                 trademark_status=trademark_status,
+                priority_score=score,
                 first_seen_at=utc_now_iso(),
                 source_description_snippet=meta["source_description_snippet"],
             )
@@ -221,7 +238,7 @@ def process_channel(
 
 
 def write_dead_links_to_csv(dead_links: List[DeadLinkEntry], output_path: str) -> None:
-    fieldnames = list(DeadLinkEntry("", "", "", "", "", None, None, False, "", "", "", "", "", "").__dict__.keys())
+    fieldnames = [f.name for f in dataclasses.fields(DeadLinkEntry)]
     rows = sorted(dead_links, key=lambda item: (item.channel_url, item.dead_domain, item.video_url))
     write_dicts_to_csv([asdict(link) for link in rows], output_path, fieldnames)
 
@@ -230,21 +247,6 @@ def _channel_url(row: dict[str, str]) -> str:
     if row.get("channel_url"):
         return row["channel_url"]
     return f"https://www.youtube.com/channel/{row['channel_id']}"
-
-
-def _load_processed_channels(path: str | None) -> set[str]:
-    if not path or not Path(path).exists():
-        return set()
-    try:
-        return set(json.loads(Path(path).read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        LOGGER.warning("Could not read Phase 2 checkpoint %s; starting fresh", path)
-        return set()
-
-
-def _save_processed_channels(path: str | None, channel_urls: set[str]) -> None:
-    if path:
-        Path(path).write_text(json.dumps(sorted(channel_urls), indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -269,54 +271,66 @@ def main() -> None:
     parser.add_argument("--check-rdap", action="store_true")
     parser.add_argument("--check-wayback", action="store_true")
     parser.add_argument("--check-trademark", action="store_true")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
-    configure_logging(json_logs=args.json_logs)
+    configure_logging(json_logs=args.json_logs, level=args.log_level)
+    configure_dns_timeout()
 
     all_dead_links: list[DeadLinkEntry] = []
+    seen_pairs: set[tuple[str, str]] = set()
     config = load_config(args.config)
     ignore_domains = set(config.get("ignore_domains", [])) or None
     allowed_tlds = normalize_tlds(config.get("allowed_tlds", [])) or None
     include_domains = parse_csv_set(args.include_domain)
     exclude_domains = parse_csv_set(args.exclude_domain)
     cache = SQLiteCache(args.cache_db, args.cache_ttl_seconds)
-    processed_channels = _load_processed_channels(args.checkpoint_file)
+    processed_channels = load_checkpoint(args.checkpoint_file)
+
     with open(args.channels_file, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            url = _channel_url(row)
-            if url in processed_channels:
-                LOGGER.info("Skipping checkpointed channel %s", url)
-                continue
-            LOGGER.info("Scanning %s", row.get("title") or url)
-            links = process_channel(
-                channel_url=url,
-                top_n_videos=args.top_n_videos,
-                dry_run=args.dry_run,
-                max_dns_workers=args.max_dns_workers,
-                ignore_domains=ignore_domains,
-                allowed_tlds=allowed_tlds,
-                include_domains=include_domains,
-                exclude_domains=exclude_domains,
-                cache=cache,
-                yt_dlp_delay=args.yt_dlp_delay,
-                yt_dlp_retries=args.yt_dlp_retries,
-                channel_timeout=args.channel_timeout,
-                enrich_http=args.enrich_http,
-                check_rdap=args.check_rdap,
-                check_wayback=args.check_wayback,
-                check_trademark=args.check_trademark,
-            )
-            all_dead_links.extend(links)
-            processed_channels.add(url)
-            _save_processed_channels(args.checkpoint_file, processed_channels)
-            LOGGER.info("Found %s candidate links", len(links))
+        rows = list(csv.DictReader(f))
+
+    total = len(rows)
+    for idx, row in enumerate(rows, 1):
+        url = _channel_url(row)
+        if url in processed_channels:
+            LOGGER.info("[%s/%s] Skipping checkpointed channel %s", idx, total, url)
+            continue
+        LOGGER.info("[%s/%s] Scanning %s", idx, total, row.get("title") or url)
+        links = process_channel(
+            channel_url=url,
+            top_n_videos=args.top_n_videos,
+            dry_run=args.dry_run,
+            max_dns_workers=args.max_dns_workers,
+            ignore_domains=ignore_domains,
+            allowed_tlds=allowed_tlds,
+            include_domains=include_domains,
+            exclude_domains=exclude_domains,
+            cache=cache,
+            yt_dlp_delay=args.yt_dlp_delay,
+            yt_dlp_retries=args.yt_dlp_retries,
+            channel_timeout=args.channel_timeout,
+            enrich_http=args.enrich_http,
+            check_rdap=args.check_rdap,
+            check_wayback=args.check_wayback,
+            check_trademark=args.check_trademark,
+        )
+        for link in links:
+            pair = (url, link.dead_domain)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                all_dead_links.append(link)
+        processed_channels.add(url)
+        save_checkpoint(args.checkpoint_file, processed_channels)
+        LOGGER.info("Found %s candidate links", len(links))
 
     write_dead_links_to_csv(all_dead_links, args.output)
-    rows = [asdict(link) for link in all_dead_links]
+    result_rows = [asdict(link) for link in all_dead_links]
     if args.json_output:
-        write_json(rows, args.json_output)
+        write_json(result_rows, args.json_output)
     if args.report_output:
-        write_markdown_report(rows, args.report_output, "Cashtube Phase 2 Summary")
+        write_markdown_report(result_rows, args.report_output, "Cashtube Phase 2 Summary")
     cache.close()
     LOGGER.info("Wrote %s rows to %s", len(all_dead_links), args.output)
 

@@ -26,15 +26,18 @@ class Phase1PaginationTest(unittest.TestCase):
 
         with mock.patch("phase1_smart_discovery.youtube_get", side_effect=responses):
             channel_ids = phase1_smart_discovery._search_legacy_video_channels(
+                session=mock.Mock(),
                 api_key="key",
                 query="tech",
                 published_before="2016-01-01T00:00:00Z",
+                published_after=None,
                 max_channels=10,
             )
 
         self.assertEqual(channel_ids, ["a", "b"])
 
     def test_recent_upload_403_keeps_channel_eligible(self) -> None:
+        """Non-fatal 403 returns None (no recent upload date), channel stays eligible."""
         response = requests.Response()
         response.status_code = 403
         response._content = b'{"error":{"message":"Forbidden","errors":[{"reason":"forbidden"}]}}'
@@ -45,14 +48,14 @@ class Phase1PaginationTest(unittest.TestCase):
             mock.patch("phase1_smart_discovery.youtube_get", side_effect=error),
             self.assertLogs("phase1_smart_discovery", level="WARNING"),
         ):
-            self.assertFalse(
-                phase1_smart_discovery._has_recent_upload(
-                    mock.Mock(),
-                    api_key="key",
-                    channel_id="channel1",
-                    recent_days=180,
-                )
+            result = phase1_smart_discovery._has_recent_upload(
+                mock.Mock(),
+                api_key="key",
+                channel_id="channel1",
+                recent_days=180,
             )
+        # None means "no recent upload detected" — channel stays eligible
+        self.assertIsNone(result)
 
     def test_recent_upload_quota_403_remains_fatal(self) -> None:
         response = requests.Response()
@@ -71,6 +74,30 @@ class Phase1PaginationTest(unittest.TestCase):
                     channel_id="channel1",
                     recent_days=180,
                 )
+
+    def test_recent_upload_returns_date_when_found(self) -> None:
+        """A channel with a recent upload returns the publishedAt date."""
+        response_data = {
+            "items": [{"snippet": {"publishedAt": "2025-01-15T10:00:00Z"}}]
+        }
+        with mock.patch("phase1_smart_discovery.youtube_get", return_value=response_data):
+            result = phase1_smart_discovery._has_recent_upload(
+                mock.Mock(),
+                api_key="key",
+                channel_id="channel1",
+                recent_days=180,
+            )
+        self.assertEqual(result, "2025-01-15T10:00:00Z")
+
+    def test_discover_channels_raises_without_keywords(self) -> None:
+        with self.assertRaises(ValueError, msg="Should require keywords"):
+            phase1_smart_discovery.discover_channels(
+                api_key="key",
+                published_before="2016-01-01T00:00:00Z",
+                min_video_count=1,
+                recent_days=0,
+                max_channels=1,
+            )
 
 
 class Phase2DryRunTest(unittest.TestCase):
@@ -102,6 +129,7 @@ class Phase2DryRunTest(unittest.TestCase):
         self.assertEqual(rows[0].dead_domain, "example.com")
         self.assertEqual(rows[0].status, "unchecked")
         self.assertEqual(rows[0].error_category, "dry_run")
+        self.assertEqual(rows[0].priority_score, 0)
 
     def test_empty_csv_still_writes_headers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -112,6 +140,7 @@ class Phase2DryRunTest(unittest.TestCase):
 
         self.assertIn("dead_domain", header)
         self.assertIn("error_category", header)
+        self.assertIn("priority_score", header)
 
 
 if __name__ == "__main__":
