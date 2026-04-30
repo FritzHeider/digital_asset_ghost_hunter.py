@@ -20,7 +20,8 @@ def is_trademarked(word):
     }
 
     try:
-        response = requests.get(api_url, headers=headers, params=params)
+        response = requests.get(api_url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
         data = response.json()
         
         # If any results come back, it's a potential risk
@@ -29,4 +30,4 @@ def is_trademarked(word):
         return False
     except Exception as e:
         print(f"Trademark check failed: {e}")
-        return True # Default to True (safe) if API fails
+        return True # Default to True (risky) if API fails

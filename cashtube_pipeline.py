@@ -1,8 +1,16 @@
 from __future__ import annotations
 import argparse
+import logging
 import os
 from typing import List
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> None:
+        return None
+
+from cashtube_utils import configure_logging, validate_published_before
 
 from phase1_smart_discovery import (
     ChannelRecord,
@@ -15,6 +23,8 @@ from phase2_dead_link_detection import (
     process_channel,
     write_dead_links_to_csv,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 def channel_id_to_url(channel_id: str) -> str:
     return f"https://www.youtube.com/channel/{channel_id}"
@@ -30,10 +40,9 @@ def run_pipeline(
     dead_links_output: str,
     min_views: int = 0,
     keywords: str | None = None,
+    dry_run: bool = False,
 ) -> None:
-    print("\n" + "=" * 60)
-    print("PHASE 1: SMART DISCOVERY")
-    print("=" * 60)
+    LOGGER.info("PHASE 1: SMART DISCOVERY")
 
     channels = discover_channels(
         api_key=api_key,
@@ -45,31 +54,29 @@ def run_pipeline(
         keywords=keywords,
     )
 
-    print(f"[*] Phase 1 Complete → {len(channels)} qualifying channels found.")
+    LOGGER.info("Phase 1 complete: %s qualifying channels found", len(channels))
     write_channels_to_csv(channels=channels, output_file=channels_output)
 
-    print("\n" + "=" * 60)
-    print("PHASE 2: DEAD LINK DETECTION")
-    print("=" * 60)
+    LOGGER.info("PHASE 2: DEAD LINK DETECTION")
 
     all_dead_links: List[DeadLinkEntry] = []
+    seen_pairs: set[tuple[str, str]] = set()
     for idx, channel in enumerate(channels, start=1):
         url = channel_id_to_url(channel.channel_id)
-        print(f"[{idx}/{len(channels)}] Scanning: {channel.title}")
+        LOGGER.info("[%s/%s] Scanning %s", idx, len(channels), channel.title)
         try:
-            links = process_channel(channel_url=url, top_n_videos=top_n_videos)
-            all_dead_links.extend(links)
-            print(f"   → Dead Links Found: {len(links)}")
-        except Exception as e:
-            print(f"   → ERROR: {e}")
+            links = process_channel(channel_url=url, top_n_videos=top_n_videos, dry_run=dry_run)
+            for link in links:
+                pair = (channel.channel_id, link.dead_domain)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    all_dead_links.append(link)
+            LOGGER.info("Dead links found: %s", len(links))
+        except Exception:
+            LOGGER.exception("Scan failed for %s", channel.title)
 
     write_dead_links_to_csv(dead_links=all_dead_links, output_path=dead_links_output)
-    
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE")
-    print(f"Total Dead Links Found: {len(all_dead_links)}")
-    print(f"Results saved to: {dead_links_output}")
-    print("=" * 60)
+    LOGGER.info("Pipeline complete: %s total rows saved to %s", len(all_dead_links), dead_links_output)
 
 def main() -> None:
     load_dotenv()
@@ -84,12 +91,19 @@ def main() -> None:
     parser.add_argument("--top-n-videos", type=int, default=20)
     parser.add_argument("--channels-output", default="phase1_results.csv")
     parser.add_argument("--dead-links-output", default="phase2_results.csv")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
+    configure_logging(json_logs=args.json_logs)
+
+    try:
+        validate_published_before(args.published_before)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     api_key = args.api_key or os.getenv("YOUTUBE_API_KEY")
     if not api_key:
-        print("[-] Error: Provide API Key via --api-key or .env YOUTUBE_API_KEY")
-        return
+        parser.error("Provide API key via --api-key or .env YOUTUBE_API_KEY")
 
     run_pipeline(
         api_key=api_key, 
@@ -102,6 +116,7 @@ def main() -> None:
         dead_links_output=args.dead_links_output,
         min_views=args.min_views, 
         keywords=args.keywords,
+        dry_run=args.dry_run,
     )
 
 if __name__ == "__main__":
