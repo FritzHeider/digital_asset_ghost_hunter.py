@@ -1,237 +1,112 @@
-# Cashtube / Digital Asset Ghost Hunter
+# Cashtube — Digital Ghost Asset Hunter
 
-## Overview
-
-Cashtube is a modular YouTube intelligence and digital asset discovery pipeline designed to identify **legacy high-traffic YouTube channels** that may contain **abandoned domains** hidden in:
-
-- Channel About pages
-- Video descriptions
-- Defunct sponsor links
-- Legacy SaaS / startup promotions
-- Old affiliate funnels
-
-Its purpose is to uncover “Digital Ghost Assets”:
-expired `.com`, `.io`, or `.net` domains still receiving evergreen traffic from old YouTube content.
+Find expired domains still receiving evergreen traffic from old YouTube content.
 
 ---
 
-# Core Concept
+## What It Does
 
-Many creators from **2010–2019** linked to:
+Cashtube is a two-phase YouTube intelligence pipeline:
 
-- Startups that failed
-- Sponsored products that vanished
-- Custom landing pages they abandoned
-- SaaS tools that shut down
-- Affiliate microsites that expired
+**Phase 1** — discovers legacy channels (pre-2016, high view counts, no recent uploads) via the YouTube Data API v3.
 
-If those domains are now dead and legally safe, they may present opportunities for:
+**Phase 2** — scans those channels' video descriptions for dead external domains using `yt-dlp` + DNS resolution.
 
-### Monetization Paths
-- Affiliate redirects
-- Domain flips
-- Niche site rebuilds
-- SEO authority capture
-- Archive reconstruction
+The target: "digital ghost assets" — `.com`, `.io`, `.net` domains that creators linked to years ago (failed startups, defunct sponsors, abandoned SaaS, expired affiliate microsites) that still receive passive SEO traffic from YouTube.
 
 ---
 
-# Project Architecture
+## Installation
 
-## Phase 1 → Smart Discovery
-Discovers qualifying YouTube channels via API.
-
-### Filters:
-- Created before `2016-01-01`
-- Tech/Gadget niche keywords
-- Sorted by view count
-- Minimum video count
-- Minimum total views
-- Recent upload activity
-
-### Files:
-- `phase1_smart_discovery.py`
-
-### Output:
-- `phase1_results.csv`
-
----
-
-## Phase 2 → Dead Link Detection
-Scans discovered channels for dead external domains.
-
-### Process:
-- Pull top videos with `yt-dlp`
-- Regex extract URLs
-- Ignore:
-  - Amazon
-  - Apple
-  - Twitter
-  - Facebook
-  - Shorteners
-- DNS resolution via `socket.gethostbyname`
-- NXDOMAIN → Candidate
-
-### Files:
-- `phase2_dead_link_detection.py`
-
-### Output:
-- `phase2_results.csv`
-
----
-
-## Phase 3 (Planned) → Validation
-### Planned:
-- USPTO Trademark Risk
-- GoDaddy / Namecheap availability
-- Wayback relevance
-- Google Spam safety
-
----
-
-## Ghost Hunter Edition
-### File:
-- `digital_asset_ghost_hunter.py`
-
-### Purpose:
-A niche-focused sponsor graveyard hunter optimized for:
-- Tech Review
-- Unboxing
-- Hardware startups
-- VC failures
-
----
-
-# Installation
-
-## 1. Clone / Extract
 ```bash
-unzip cashtube_full_project.zip
-cd cashtube
-```
+git clone https://github.com/FritzHeider/digital_asset_ghost_hunter.py.git
+cd digital_asset_ghost_hunter.py
 
-## 2. Create Virtual Environment
-```bash
 python3 -m venv venv
 source venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-## 3. Install Requirements
+Python 3.11+ required.
+
+---
+
+## Environment
+
 ```bash
-pip install -r requirements.txt
+cp .env .env.local
+# Edit .env.local and set:
+# YOUTUBE_API_KEY=...
+# USPTO_API_KEY=...   (optional, for trademark checks)
 ```
 
----
-
-# Environment Setup
-
-Create `.env`
-
-```env
-YOUTUBE_API_KEY=YOUR_API_KEY
-```
+Or pass `--api-key` directly on the CLI.
 
 ---
 
-# Google API Setup
+## Google Cloud Setup
 
-## Required:
-### Enable:
-**YouTube Data API v3**
+Enable **YouTube Data API v3** in Google Cloud Console and create an API key.
 
-### Use:
-**Public Data**
+Default daily quota: **10,000 units**. Phase 1 uses ~1 unit per channel checked (via `playlistItems.list`). Phase 1 keyword searches use ~100 units each — keep `--max-channels` reasonable.
 
-### Important:
-If you receive `403 Forbidden`, verify:
-
-- API enabled
-- Billing enabled
-- API key unrestricted (for testing)
-- Correct project selected
-- Quota available
+If you get a `403 quotaExceeded` error, your daily quota is exhausted. Wait until midnight Pacific time or request a quota increase.
 
 ---
 
-# Usage
+## Usage
 
----
-
-## Run Phase 1 Only
+### Full pipeline (Phase 1 → Phase 2)
 ```bash
-python phase1_smart_discovery.py \
-    --api-key YOUR_API_KEY \
+cashtube pipeline \
+    --api-key YOUR_KEY \
     --published-before 2016-01-01T00:00:00Z \
     --min-video-count 50 \
-    --recent-days 180 \
     --max-channels 100 \
-    --output phase1_results.csv
+    --top-n-videos 20
 ```
 
----
-
-## Run Phase 2 Only
+### Phase 1 only — discover channels
 ```bash
-python phase2_dead_link_detection.py \
+cashtube phase1 \
+    --api-key YOUR_KEY \
+    --published-before 2016-01-01T00:00:00Z \
+    --min-video-count 50 \
+    --max-channels 100
+```
+
+### Phase 2 only — scan for dead domains
+```bash
+cashtube phase2 \
     --channels-file phase1_results.csv \
-    --top-n-videos 20 \
-    --output phase2_results.csv
+    --top-n-videos 20
 ```
 
----
-
-## Run Full Pipeline
+### Ghost Hunter — niche-focused tech/startup graveyard scan
 ```bash
-cashtube pipeline \
-    --api-key YOUR_API_KEY \
+cashtube ghost \
+    --api-key YOUR_KEY \
     --published-before 2016-01-01T00:00:00Z \
-    --min-video-count 50 \
-    --recent-days 180 \
-    --max-channels 100 \
+    --min-views 2000000 \
     --top-n-videos 20 \
-    --channels-output phase1_results.csv \
-    --dead-links-output phase2_results.csv
+    --output ghost_results.csv
 ```
 
-## Dry Run and Structured Logs
-Use `--dry-run` to extract candidate domains without DNS checks. Use
-`--json-logs` when piping logs into a collector.
-
+### Dry run — extract candidates without DNS checks
 ```bash
 cashtube pipeline \
-    --api-key YOUR_API_KEY \
+    --api-key YOUR_KEY \
     --dry-run \
     --json-logs \
     --json-output phase2_results.json \
     --report-output phase2_summary.md
 ```
 
-## Config Files
-Keywords, ignored domains, and allowed TLDs can be loaded from JSON or YAML.
-
-```json
-{
-  "keywords": ["tech review", "unboxing", "kickstarter gadget"],
-  "ignore_domains": ["youtube.com", "amazon.com"],
-  "allowed_tlds": [".com", ".io", ".net"]
-}
-```
-
-```bash
-cashtube pipeline \
-    --api-key YOUR_API_KEY \
-    --keywords-file cashtube-config.json \
-    --config cashtube-config.json \
-    --include-domain example.com \
-    --exclude-domain youtube.com \
-    --cache-db .cashtube_cache.sqlite3 \
-    --cache-ttl-seconds 86400
-```
+---
 
 ## Phase 2 Enrichment
-Optional checks can annotate DNS candidates with HTTP/SSL, parking-page,
-RDAP, Wayback, and trademark risk signals. Trademark checks use
-`USPTO_API_KEY` from the environment.
+
+Optional signals can be added to each dead domain candidate:
 
 ```bash
 cashtube phase2 \
@@ -245,145 +120,109 @@ cashtube phase2 \
     --yt-dlp-retries 3
 ```
 
+Trademark checks require `USPTO_API_KEY` in the environment.
+
 ---
 
-## Run Ghost Hunter
+## Config Files
+
+Keywords, ignored domains, and allowed TLDs can be loaded from JSON or YAML:
+
+```json
+{
+  "keywords": ["tech review", "unboxing", "kickstarter gadget"],
+  "ignore_domains": ["youtube.com", "amazon.com"],
+  "allowed_tlds": [".com", ".io", ".net"]
+}
+```
+
 ```bash
-python digital_asset_ghost_hunter.py \
-    --api-key YOUR_API_KEY \
-    --published-before 2016-01-01T00:00:00Z \
-    --min-views 2000000 \
-    --top-n-videos 20 \
-    --output ghost_results.csv
+cashtube pipeline \
+    --api-key YOUR_KEY \
+    --keywords-file cashtube-config.json \
+    --config cashtube-config.json \
+    --cache-ttl-seconds 86400
 ```
 
 ---
 
-# Output Schema
+## Outputs
 
-## Phase 1 CSV
+### `phase1_results.csv`
 | Field | Description |
-|------|-------------|
-| channel_id | YouTube channel ID |
-| title | Channel title |
-| created_at | Channel creation date |
-| video_count | Uploaded videos |
-| view_count | Total channel views |
-| last_upload | Most recent upload |
+|---|---|
+| `channel_id` | YouTube channel ID |
+| `title` | Channel name |
+| `view_count` | Total channel views |
+| `video_count` | Number of uploaded videos |
+| `published_at` | Channel creation date |
+| `last_upload` | Most recent upload date (empty = no recent uploads) |
+| `source_keyword` | Search keyword that found the channel |
 
----
-
-## Phase 2 CSV
+### `phase2_results.csv`
 | Field | Description |
-|------|-------------|
-| channel_url | Channel URL |
-| video_url | Source video |
-| dead_link | Dead external domain |
-| status | DNS fail |
-| priority_score | Basic ROI score |
+|---|---|
+| `channel_url` | Source channel URL |
+| `video_url` | Video where the domain was found |
+| `dead_domain` | Candidate expired domain |
+| `status` | DNS status (`NXDOMAIN`, etc.) |
+| `error_category` | Error classification |
+| `http_status` | HTTP response code (if `--enrich-http`) |
+| `ssl_ok` | SSL valid (if `--enrich-http`) |
+| `parking_detected` | Domain parked/for-sale signal |
+| `availability_signal` | Registrar availability hint |
+| `rdap_status` | RDAP lookup result (if `--check-rdap`) |
+| `wayback_status` | Wayback Machine result (if `--check-wayback`) |
+| `trademark_status` | USPTO risk signal (if `--check-trademark`) |
+| `priority_score` | Composite ROI score |
+| `first_seen_at` | Timestamp of first detection |
+| `source_description_snippet` | Context snippet from video description |
 
 ---
 
-# Security Notes
+## Architecture
 
-## Recommended:
-- Restrict API key by IP
-- Rotate secrets
-- Move keys to Secrets Manager
-- Use PostgreSQL cache
-- Add rate limiting
-- Add retry logic
-- Add OpenTelemetry
+| File | Role |
+|---|---|
+| `cashtube/cli.py` | Entry point; dispatches `pipeline`, `phase1`, `phase2`, `ghost` |
+| `cashtube_utils.py` | Shared utilities: HTTP session, DNS, SQLite cache, rate limiter |
+| `phase1_smart_discovery.py` | YouTube API → `ChannelRecord` dataclasses → `phase1_results.csv` |
+| `phase2_dead_link_detection.py` | yt-dlp scraping → `DeadLinkEntry` dataclasses → `phase2_results.csv` |
+| `cashtube_pipeline.py` | Wires Phase 1 → Phase 2 with checkpointing and dedup |
+| `digital_asset_ghost_hunter.py` | Standalone niche-focused variant (tech/startup graveyard) |
+| `trademarked.py` | Trademark risk utilities |
 
----
-
-# Known Risks
-
-## False Positives:
-A DNS failure may mean:
-- Temporary outage
-- Parking
-- Registrar hold
-- Geo DNS issue
-
-### Solution:
-Phase 3 domain registrar validation required.
+Run state is stored in `.cashtube_channels_seen.json` and `.cashtube_phase2_checkpoint.json` (gitignored) so interrupted runs resume cleanly.
 
 ---
 
-# Ethical Guardrails
+## Linting and Tests
 
-## Do:
-- Analyze public metadata
-- Evaluate domain history
-- Check legal safety
-
-## Do Not:
-- Attempt CAPTCHA bypass
-- Harvest protected emails
-- Impersonate trademarks
-- Abuse registrar systems
-
----
-
-# Best Niches (2026)
-### Highest ROI:
-## Tech Review / Startup Graveyard
-Examples:
-- Hardware startups
-- Smart home failures
-- Kickstarter collapses
-- SaaS shutdowns
-
----
-
-# Future Enhancements
-
-## Planned:
-- USPTO API
-- GoDaddy API
-- Namecheap API
-- Wayback Machine
-- PostgreSQL
-- Dashboard UI
-- OpenTelemetry
-- Async queue workers
-
----
-
-# Troubleshooting
-
-## 403 Forbidden:
-Check Google Cloud setup.
-
-## yt-dlp Failure:
 ```bash
-pip install --upgrade yt-dlp
-```
-
-## DNS False Positives:
-Test manually:
-```bash
-nslookup domain.com
+ruff check .
+black --check .
+mypy .
+python -m pytest tests/
 ```
 
 ---
 
-# Disclaimer
+## Known Limitations
 
-This project is for:
-### Research, SEO intelligence, and lawful domain investment only.
-
-Always validate:
-- Trademark
-- Legal ownership
-- Brand safety
-- Historical use
+- **DNS false positives**: `NXDOMAIN` can mean a temporary outage, registrar hold, or geo-DNS issue — not guaranteed availability. Verify with a registrar before acting.
+- **YouTube quota**: Default 10,000 units/day. Large `--max-channels` values will exhaust it.
+- **yt-dlp**: Keep updated (`pip install --upgrade yt-dlp`). YouTube changes break older versions.
 
 ---
 
-# Final Thought
+## Ethical Use
 
-The internet forgets surprisingly expensive things.
+- Analyze public metadata only
+- Verify trademark and legal status before registering any domain
+- Do not attempt CAPTCHA bypass, email harvesting, or registrar abuse
 
-Cashtube exists to find them before someone else does.# digital_asset_ghost_hunter.py
+This tool is for research, SEO intelligence, and lawful domain investment only.
+
+---
+
+*The internet forgets surprisingly expensive things. Cashtube finds them.*
