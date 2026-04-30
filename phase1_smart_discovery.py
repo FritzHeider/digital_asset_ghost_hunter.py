@@ -102,24 +102,76 @@ def _search_legacy_video_channels(
     return channel_ids
 
 
+def _handle_recent_upload_403(
+    exc: requests.HTTPError,
+    label: str,
+) -> None:
+    """Re-raise fatal 403s; log and swallow non-fatal ones."""
+    response = exc.response
+    if response is None or response.status_code != 403:
+        raise exc
+    reason, message = _youtube_error_details(response)
+    if reason in FATAL_YOUTUBE_403_REASONS:
+        raise exc
+    LOGGER.warning(
+        "Could not check recent uploads for %s due to YouTube 403%s; keeping channel eligible",
+        label,
+        f" ({reason}: {message})" if reason or message else "",
+    )
+
+
 def _has_recent_upload(
     session: requests.Session,
     api_key: str,
     channel_id: str,
     recent_days: int,
     rate_limiter: RateLimiter | None = None,
+    uploads_playlist_id: str | None = None,
 ) -> Optional[str]:
     """Return the most recent upload date (ISO string) if the channel uploaded
     within ``recent_days``, or None if it has not.
 
-    A non-fatal YouTube 403 (e.g. restricted channel) returns None — the
-    channel is treated as having no recent uploads and stays eligible.
-    A fatal 403 (quota, bad key) re-raises so the caller can abort.
+    When ``uploads_playlist_id`` is supplied (from a prior channels.list
+    contentDetails fetch) this uses ``playlistItems.list`` (1 quota unit).
+    Otherwise it falls back to ``search`` (100 quota units).
+
+    A non-fatal YouTube 403 returns None; a fatal 403 re-raises.
     """
     if recent_days <= 0:
         return None
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
+
+    if uploads_playlist_id:
+        try:
+            data = youtube_get(
+                session,
+                "playlistItems",
+                {
+                    "part": "contentDetails",
+                    "playlistId": uploads_playlist_id,
+                    "maxResults": 1,
+                    "key": api_key,
+                },
+                rate_limiter=rate_limiter,
+            )
+        except requests.HTTPError as exc:
+            _handle_recent_upload_403(exc, f"playlist {uploads_playlist_id}")
+            return None
+
+        items = data.get("items", [])
+        if not items:
+            return None
+        published_at = items[0].get("contentDetails", {}).get("videoPublishedAt", "")
+        if not published_at:
+            return None
+        try:
+            upload_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return published_at if upload_dt >= cutoff else None
+
+    # Fallback: search API (costs 100 quota units — avoid when possible)
     published_after = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
     try:
         data = youtube_get(
@@ -136,19 +188,7 @@ def _has_recent_upload(
             rate_limiter=rate_limiter,
         )
     except requests.HTTPError as exc:
-        response = exc.response
-        if response is None or response.status_code != 403:
-            raise
-
-        reason, message = _youtube_error_details(response)
-        if reason in FATAL_YOUTUBE_403_REASONS:
-            raise
-
-        LOGGER.warning(
-            "Could not check recent uploads for channel %s due to YouTube 403%s; keeping channel eligible",
-            channel_id,
-            f" ({reason}: {message})" if reason or message else "",
-        )
+        _handle_recent_upload_403(exc, f"channel {channel_id}")
         return None
 
     items = data.get("items", [])
@@ -230,7 +270,7 @@ def discover_channels(
             session,
             "channels",
             {
-                "part": "snippet,statistics",
+                "part": "snippet,statistics,contentDetails",
                 "id": ",".join(batch),
                 "key": api_key,
             },
@@ -243,8 +283,18 @@ def discover_channels(
             if video_count < min_video_count or view_count < min_views:
                 continue
 
+            uploads_playlist_id = (
+                item.get("contentDetails", {})
+                .get("relatedPlaylists", {})
+                .get("uploads", "")
+            )
             last_upload = _has_recent_upload(
-                session, api_key, item["id"], recent_days, rate_limiter
+                session,
+                api_key,
+                item["id"],
+                recent_days,
+                rate_limiter,
+                uploads_playlist_id=uploads_playlist_id or None,
             )
             if last_upload is not None:
                 # Channel uploaded recently — still active, not a ghost target
