@@ -1,7 +1,10 @@
 from __future__ import annotations
 import argparse
+import json
 import logging
 import os
+from dataclasses import asdict
+from pathlib import Path
 from typing import List
 
 try:
@@ -10,7 +13,16 @@ except ImportError:
     def load_dotenv() -> None:
         return None
 
-from cashtube_utils import configure_logging, validate_published_before
+from cashtube_utils import (
+    SQLiteCache,
+    configure_logging,
+    load_config,
+    normalize_tlds,
+    parse_csv_set,
+    validate_published_before,
+    write_json,
+    write_markdown_report,
+)
 
 from phase1_smart_discovery import (
     ChannelRecord,
@@ -29,6 +41,21 @@ LOGGER = logging.getLogger(__name__)
 def channel_id_to_url(channel_id: str) -> str:
     return f"https://www.youtube.com/channel/{channel_id}"
 
+
+def _load_processed_channels(path: str | None) -> set[str]:
+    if not path or not Path(path).exists():
+        return set()
+    try:
+        return set(json.loads(Path(path).read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("Could not read pipeline checkpoint %s; starting fresh", path)
+        return set()
+
+
+def _save_processed_channels(path: str | None, channel_urls: set[str]) -> None:
+    if path:
+        Path(path).write_text(json.dumps(sorted(channel_urls), indent=2) + "\n", encoding="utf-8")
+
 def run_pipeline(
     api_key: str,
     published_before: str,
@@ -40,7 +67,25 @@ def run_pipeline(
     dead_links_output: str,
     min_views: int = 0,
     keywords: str | None = None,
+    keyword_list: list[str] | None = None,
     dry_run: bool = False,
+    json_output: str | None = None,
+    report_output: str | None = None,
+    checkpoint_file: str | None = ".cashtube_channels_seen.json",
+    scan_checkpoint_file: str | None = ".cashtube_phase2_checkpoint.json",
+    youtube_delay: float = 0.0,
+    phase2_config: dict | None = None,
+    include_domains: set[str] | None = None,
+    exclude_domains: set[str] | None = None,
+    cache_db: str | None = ".cashtube_cache.sqlite3",
+    cache_ttl_seconds: int = 86400,
+    yt_dlp_delay: float = 0.0,
+    yt_dlp_retries: int = 3,
+    channel_timeout: float | None = None,
+    enrich_http: bool = False,
+    check_rdap: bool = False,
+    check_wayback: bool = False,
+    check_trademark: bool = False,
 ) -> None:
     LOGGER.info("PHASE 1: SMART DISCOVERY")
 
@@ -52,6 +97,9 @@ def run_pipeline(
         max_channels=max_channels,
         min_views=min_views,
         keywords=keywords,
+        keyword_list=keyword_list,
+        checkpoint_file=checkpoint_file,
+        youtube_delay=youtube_delay,
     )
 
     LOGGER.info("Phase 1 complete: %s qualifying channels found", len(channels))
@@ -61,21 +109,52 @@ def run_pipeline(
 
     all_dead_links: List[DeadLinkEntry] = []
     seen_pairs: set[tuple[str, str]] = set()
+    cache = SQLiteCache(cache_db, cache_ttl_seconds)
+    processed_channels = _load_processed_channels(scan_checkpoint_file)
+    ignore_domains = set((phase2_config or {}).get("ignore_domains", [])) or None
+    allowed_tlds = normalize_tlds((phase2_config or {}).get("allowed_tlds", [])) or None
     for idx, channel in enumerate(channels, start=1):
         url = channel_id_to_url(channel.channel_id)
+        if url in processed_channels:
+            LOGGER.info("Skipping checkpointed channel %s", url)
+            continue
         LOGGER.info("[%s/%s] Scanning %s", idx, len(channels), channel.title)
         try:
-            links = process_channel(channel_url=url, top_n_videos=top_n_videos, dry_run=dry_run)
+            links = process_channel(
+                channel_url=url,
+                top_n_videos=top_n_videos,
+                dry_run=dry_run,
+                ignore_domains=ignore_domains,
+                allowed_tlds=allowed_tlds,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+                cache=cache,
+                yt_dlp_delay=yt_dlp_delay,
+                yt_dlp_retries=yt_dlp_retries,
+                channel_timeout=channel_timeout,
+                enrich_http=enrich_http,
+                check_rdap=check_rdap,
+                check_wayback=check_wayback,
+                check_trademark=check_trademark,
+            )
             for link in links:
                 pair = (channel.channel_id, link.dead_domain)
                 if pair not in seen_pairs:
                     seen_pairs.add(pair)
                     all_dead_links.append(link)
             LOGGER.info("Dead links found: %s", len(links))
+            processed_channels.add(url)
+            _save_processed_channels(scan_checkpoint_file, processed_channels)
         except Exception:
             LOGGER.exception("Scan failed for %s", channel.title)
 
     write_dead_links_to_csv(dead_links=all_dead_links, output_path=dead_links_output)
+    rows = [asdict(link) for link in all_dead_links]
+    if json_output:
+        write_json(rows, json_output)
+    if report_output:
+        write_markdown_report(rows, report_output, "Cashtube Pipeline Summary")
+    cache.close()
     LOGGER.info("Pipeline complete: %s total rows saved to %s", len(all_dead_links), dead_links_output)
 
 def main() -> None:
@@ -88,9 +167,27 @@ def main() -> None:
     parser.add_argument("--max-channels", type=int, default=100)
     parser.add_argument("--min-views", type=int, default=0)
     parser.add_argument("--keywords", default=None)
+    parser.add_argument("--keywords-file", default=None)
     parser.add_argument("--top-n-videos", type=int, default=20)
     parser.add_argument("--channels-output", default="phase1_results.csv")
     parser.add_argument("--dead-links-output", default="phase2_results.csv")
+    parser.add_argument("--json-output", default=None)
+    parser.add_argument("--report-output", default=None)
+    parser.add_argument("--checkpoint-file", default=".cashtube_channels_seen.json")
+    parser.add_argument("--scan-checkpoint-file", default=".cashtube_phase2_checkpoint.json")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--include-domain", default=None)
+    parser.add_argument("--exclude-domain", default=None)
+    parser.add_argument("--cache-db", default=".cashtube_cache.sqlite3")
+    parser.add_argument("--cache-ttl-seconds", type=int, default=86400)
+    parser.add_argument("--youtube-delay", type=float, default=0.0)
+    parser.add_argument("--yt-dlp-delay", type=float, default=0.0)
+    parser.add_argument("--yt-dlp-retries", type=int, default=3)
+    parser.add_argument("--channel-timeout", type=float, default=None)
+    parser.add_argument("--enrich-http", action="store_true")
+    parser.add_argument("--check-rdap", action="store_true")
+    parser.add_argument("--check-wayback", action="store_true")
+    parser.add_argument("--check-trademark", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
@@ -105,6 +202,8 @@ def main() -> None:
     if not api_key:
         parser.error("Provide API key via --api-key or .env YOUTUBE_API_KEY")
 
+    keyword_config = load_config(args.keywords_file)
+    phase2_config = load_config(args.config)
     run_pipeline(
         api_key=api_key, 
         published_before=args.published_before,
@@ -116,7 +215,25 @@ def main() -> None:
         dead_links_output=args.dead_links_output,
         min_views=args.min_views, 
         keywords=args.keywords,
+        keyword_list=keyword_config.get("keywords") if keyword_config else None,
         dry_run=args.dry_run,
+        json_output=args.json_output,
+        report_output=args.report_output,
+        checkpoint_file=args.checkpoint_file,
+        scan_checkpoint_file=args.scan_checkpoint_file,
+        youtube_delay=args.youtube_delay,
+        phase2_config=phase2_config,
+        include_domains=parse_csv_set(args.include_domain),
+        exclude_domains=parse_csv_set(args.exclude_domain),
+        cache_db=args.cache_db,
+        cache_ttl_seconds=args.cache_ttl_seconds,
+        yt_dlp_delay=args.yt_dlp_delay,
+        yt_dlp_retries=args.yt_dlp_retries,
+        channel_timeout=args.channel_timeout,
+        enrich_http=args.enrich_http,
+        check_rdap=args.check_rdap,
+        check_wayback=args.check_wayback,
+        check_trademark=args.check_trademark,
     )
 
 if __name__ == "__main__":
