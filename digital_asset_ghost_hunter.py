@@ -6,6 +6,7 @@ import re
 import socket
 import os
 import concurrent.futures
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Dict, List, Set
 
@@ -52,12 +53,12 @@ class Channel:
 def get_domain(url: str) -> str:
     """Extracts and normalizes the root domain from a URL."""
     try:
-        domain = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
-        domain = domain.lower()
+        parsed = urlparse(url)
+        domain = (parsed.hostname or "").lower()
         if domain.startswith("www."):
             domain = domain[4:]
         return domain
-    except (IndexError, AttributeError):
+    except Exception:
         return ""
 
 def is_interesting_domain(domain: str) -> bool:
@@ -67,12 +68,18 @@ def is_interesting_domain(domain: str) -> bool:
     return any(domain.endswith(tld) for tld in ALLOWED_TLDS)
 
 def domain_is_dead(domain: str) -> bool:
-    """Returns True if the domain fails to resolve (NXDOMAIN)."""
+    """
+    Returns True when DNS definitively reports non-existence (NXDOMAIN).
+    Temporary DNS errors/timeouts are treated as non-dead to reduce false positives.
+    """
     try:
-        socket.gethostbyname(domain)
+        socket.getaddrinfo(domain, None)
         return False
-    except socket.gaierror:
-        return True
+    except socket.gaierror as e:
+        # EAI_NONAME is the strongest "does not exist" signal.
+        return getattr(socket, "EAI_NONAME", None) == e.errno
+    except (socket.timeout, TimeoutError):
+        return False
 
 # =========================
 # PHASE 2: VIDEO SCANNING
@@ -138,6 +145,7 @@ def extract_dead_links(channel_id: str, top_n_videos: int) -> List[str]:
 
 def search_channels(api_key: str, published_before: str, min_views: int) -> List[Channel]:
     discovered: Dict[str, Channel] = {}
+    session = requests.Session()
 
     for keyword in TECH_KEYWORDS:
         print(f"[*] Querying YouTube API for: {keyword}")
@@ -152,18 +160,18 @@ def search_channels(api_key: str, published_before: str, min_views: int) -> List
         }
         
         try:
-            r = requests.get(f"{YOUTUBE_API_BASE_URL}/search", params=params, timeout=15)
+            r = session.get(f"{YOUTUBE_API_BASE_URL}/search", params=params, timeout=15)
             r.raise_for_status()
             items = r.json().get("items", [])
             
             cids = [i['snippet']['channelId'] for i in items if i.get('snippet')]
             
             if cids:
-                d_r = requests.get(f"{YOUTUBE_API_BASE_URL}/channels", params={
+                d_r = session.get(f"{YOUTUBE_API_BASE_URL}/channels", params={
                     "part": "snippet,statistics",
                     "id": ",".join(cids),
                     "key": api_key
-                })
+                }, timeout=15)
                 d_r.raise_for_status()
                 for c in d_r.json().get("items", []):
                     views = int(c['statistics'].get('viewCount', 0))
@@ -176,7 +184,7 @@ def search_channels(api_key: str, published_before: str, min_views: int) -> List
         except Exception as e:
             print(f"   [!] YouTube API Error: {e}")
 
-    return list(discovered.values())
+    return sorted(discovered.values(), key=lambda c: c.view_count, reverse=True)
 
 # =========================
 # MAIN ENTRY
@@ -184,6 +192,7 @@ def search_channels(api_key: str, published_before: str, min_views: int) -> List
 
 def main():
     load_dotenv()
+    socket.setdefaulttimeout(5.0)
     
     parser = argparse.ArgumentParser(description="Digital Asset Ghost Hunter")
     parser.add_argument("--api-key", help="YouTube API Key")
