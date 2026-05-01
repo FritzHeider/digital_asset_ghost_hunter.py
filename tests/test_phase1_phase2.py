@@ -99,6 +99,33 @@ class Phase1PaginationTest(unittest.TestCase):
                 max_channels=1,
             )
 
+    def test_search_quota_error_logs_warning_and_returns_partial(self) -> None:
+        page1 = {"items": [{"snippet": {"channelId": "ch1"}}], "nextPageToken": "tok"}
+        from cashtube_utils import YouTubeQuotaError
+        responses = [page1, YouTubeQuotaError("quota")]
+
+        def side_effect(*args, **kwargs):
+            val = responses.pop(0)
+            if isinstance(val, Exception):
+                raise val
+            return val
+
+        with (
+            mock.patch("phase1_smart_discovery.youtube_get", side_effect=side_effect),
+            self.assertLogs("phase1_smart_discovery", level="WARNING") as cm,
+        ):
+            ids = phase1_smart_discovery._search_legacy_video_channels(
+                session=mock.Mock(),
+                api_key="key",
+                query="tech",
+                published_before="2016-01-01T00:00:00Z",
+                published_after=None,
+                max_channels=50,
+            )
+
+        self.assertEqual(ids, ["ch1"])
+        self.assertTrue(any("Quota exhausted" in msg for msg in cm.output))
+
 
 class Phase2DryRunTest(unittest.TestCase):
     def test_process_channel_dry_run_schema(self) -> None:

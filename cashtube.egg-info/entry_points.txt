@@ -1,0 +1,3 @@
+[console_scripts]
+cashtube = cashtube.cli:main
+cashtube-wizard = cashtube.wizard:run

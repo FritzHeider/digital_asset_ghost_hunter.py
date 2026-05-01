@@ -4,6 +4,7 @@ import argparse
 import csv
 import logging
 import os
+import time
 
 try:
     from dotenv import load_dotenv
@@ -39,7 +40,8 @@ def main() -> None:
     parser.add_argument("--published-before", default="2016-01-01T00:00:00Z")
     parser.add_argument("--min-views", type=int, default=2_000_000)
     parser.add_argument("--min-video-count", type=int, default=50)
-    parser.add_argument("--recent-days", type=int, default=180)
+    parser.add_argument("--recent-days", type=int, default=180,
+                        help="Skip channels with uploads within this many days (0=keep all)")
     parser.add_argument("--top-n-videos", type=int, default=20)
     parser.add_argument("--max-channels", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
@@ -60,6 +62,7 @@ def main() -> None:
     if not api_key:
         parser.error("YouTube API key not found. Set YOUTUBE_API_KEY or pass --api-key.")
 
+    start = time.time()
     channels = discover_channels(
         api_key=api_key,
         published_before=args.published_before,
@@ -119,6 +122,7 @@ def main() -> None:
         writer.writerows(all_results)
 
     LOGGER.info("Hunt complete: wrote %s leads to %s", len(all_results), args.output)
+    LOGGER.info("Ghost hunter runtime: %.2fs", time.time() - start)
 
 
 if __name__ == "__main__":

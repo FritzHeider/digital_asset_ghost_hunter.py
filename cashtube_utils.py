@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import socket
 import sqlite3
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - exercised when optional dependency is 
 YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3"
 DEFAULT_TIMEOUT = 15
 DEFAULT_CACHE_TTL_SECONDS = 86400
+_QUOTA_EXHAUSTED_REASONS = frozenset({"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"})
 
 URL_PATTERN = re.compile(
     r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F]{2}))+"
@@ -153,14 +155,16 @@ class RateLimiter:
     def __init__(self, delay_seconds: float = 0.0) -> None:
         self.delay_seconds = max(delay_seconds, 0.0)
         self._last_call = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
         if self.delay_seconds <= 0:
             return
-        elapsed = time.monotonic() - self._last_call
-        if elapsed < self.delay_seconds:
-            time.sleep(self.delay_seconds - elapsed)
-        self._last_call = time.monotonic()
+        with self._lock:
+            elapsed = time.monotonic() - self._last_call
+            if elapsed < self.delay_seconds:
+                time.sleep(self.delay_seconds - elapsed)
+            self._last_call = time.monotonic()
 
 
 def validate_published_before(value: str) -> str:
@@ -181,6 +185,10 @@ def chunked(values: list[str], size: int) -> Iterable[list[str]]:
         yield values[start : start + size]
 
 
+class YouTubeQuotaError(Exception):
+    """Raised when the YouTube API returns a quota-exhausted 403."""
+
+
 def youtube_get(
     session: requests.Session,
     endpoint: str,
@@ -195,6 +203,20 @@ def youtube_get(
         params=params,
         timeout=timeout,
     )
+    if response.status_code == 403:
+        try:
+            body = response.json()
+            reasons = [
+                e.get("reason", "")
+                for e in body.get("error", {}).get("errors", [])
+            ]
+        except Exception:
+            reasons = []
+        if _QUOTA_EXHAUSTED_REASONS.intersection(reasons):
+            raise YouTubeQuotaError(
+                f"YouTube API quota exhausted (reason: {reasons}). "
+                "Quota resets at midnight Pacific time."
+            )
     response.raise_for_status()
     return response.json()
 
@@ -238,10 +260,19 @@ def write_json(rows: list[dict[str, Any]], output_path: str) -> None:
         f.write("\n")
 
 
+def _tld(domain: str) -> str:
+    if not domain or "." not in domain:
+        return ""
+    parts = domain.split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in COMMON_MULTIPART_SUFFIXES:
+        return "." + ".".join(parts[-2:])
+    return "." + parts[-1]
+
+
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total_rows": len(rows),
-        "by_tld": dict(Counter(Path(row.get("dead_domain", "")).suffix for row in rows if row.get("dead_domain"))),
+        "by_tld": dict(Counter(_tld(row.get("dead_domain", "")) for row in rows if row.get("dead_domain"))),
         "by_dns_status": dict(Counter(row.get("status", "unknown") for row in rows)),
         "by_channel": dict(Counter(row.get("channel_url") or row.get("channel_id") or "unknown" for row in rows)),
         "by_keyword": dict(Counter(row.get("source_keyword", "") for row in rows if row.get("source_keyword"))),
@@ -310,7 +341,12 @@ class SQLiteCache:
 
 
 def extract_urls(text: str) -> list[str]:
-    return URL_PATTERN.findall(text or "")
+    results = []
+    for url in URL_PATTERN.findall(text or ""):
+        url = url.rstrip(".,;:!?)")
+        if url:
+            results.append(url)
+    return results
 
 
 def get_domain(url: str) -> str:
@@ -450,16 +486,16 @@ def wayback_lookup(session: requests.Session, domain: str, timeout: int = DEFAUL
             params={"url": domain, "output": "json", "limit": 1},
             timeout=timeout,
         )
-        if response.ok and len(response.json()) > 1:
-            return "snapshot_found"
+        if response.ok:
+            data = response.json()
+            if isinstance(data, list) and len(data) > 1:
+                return "snapshot_found"
         return "none"
     except (ValueError, requests.RequestException):
         return "error"
 
 
 def trademark_risk(session: requests.Session, word: str, timeout: int = DEFAULT_TIMEOUT) -> str:
-    import os
-
     token = os.getenv("USPTO_API_KEY")
     if not token:
         return "not_configured"

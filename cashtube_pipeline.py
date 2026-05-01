@@ -19,6 +19,7 @@ from cashtube_utils import (
     configure_logging,
     load_checkpoint,
     load_config,
+    make_session,
     normalize_tlds,
     parse_csv_set,
     prompt_for_keywords,
@@ -105,6 +106,7 @@ def run_pipeline(
     allowed_tlds = normalize_tlds((phase2_config or {}).get("allowed_tlds", [])) or None
     cache = SQLiteCache(cache_db, cache_ttl_seconds)
     processed_channels = load_checkpoint(scan_checkpoint_file)
+    enrich_session = make_session() if (enrich_http or check_rdap or check_wayback or check_trademark) else None
 
     all_dead_links: list[DeadLinkEntry] = []
     seen_pairs: set[tuple[str, str]] = set()
@@ -131,6 +133,7 @@ def run_pipeline(
                 check_rdap=check_rdap,
                 check_wayback=check_wayback,
                 check_trademark=check_trademark,
+                session=enrich_session,
             )
             LOGGER.info("[%s/%s] Dead links found: %s", idx, total, len(links))
             return url, links
