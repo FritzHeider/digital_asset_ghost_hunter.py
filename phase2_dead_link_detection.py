@@ -86,6 +86,7 @@ def process_channel(
     check_rdap: bool = False,
     check_wayback: bool = False,
     check_trademark: bool = False,
+    session: requests.Session | None = None,
 ) -> List[DeadLinkEntry]:
     """Scrape top video descriptions and return dead-domain candidates."""
     try:
@@ -126,6 +127,11 @@ def process_channel(
                 return info
             except TimeoutError:
                 raise
+            except yt_dlp.utils.ExtractorError as exc:
+                if exc.expected:
+                    raise  # permanent error (unavailable, age-restricted, etc.) — don't retry
+                last_exc = exc
+                time.sleep(min(2**attempt, 8))
             except Exception as exc:
                 last_exc = exc
                 time.sleep(min(2**attempt, 8))
@@ -145,7 +151,11 @@ def process_channel(
                     continue
 
                 video_url = f"https://www.youtube.com/watch?v={video_id}"
-                video_info = extract_info(ydl, video_url)
+                try:
+                    video_info = extract_info(ydl, video_url)
+                except Exception:
+                    LOGGER.debug("Skipping unavailable video %s", video_url)
+                    continue
                 description = video_info.get("description", "")
 
                 for url in extract_urls(description):
@@ -200,18 +210,18 @@ def process_channel(
         checks = list(executor.map(cached_classify, sorted(discovered)))
 
     results: list[DeadLinkEntry] = []
-    session = make_session()
+    _session = session or make_session()
     for check in checks:
         status = check.status.value if isinstance(check.status, DnsStatus) else check.status
         if status != DnsStatus.NXDOMAIN.value:
             continue
         domain = check.domain
         meta = discovered[domain]
-        http_check = check_http_domain(session, domain) if enrich_http else None
-        rdap_status = rdap_lookup(session, domain) if check_rdap else "unchecked"
-        wayback_status = wayback_lookup(session, domain) if check_wayback else "unchecked"
+        http_check = check_http_domain(_session, domain) if enrich_http else None
+        rdap_status = rdap_lookup(_session, domain) if check_rdap else "unchecked"
+        wayback_status = wayback_lookup(_session, domain) if check_wayback else "unchecked"
         trademark_status = (
-            trademark_risk(session, domain.split(".", 1)[0]) if check_trademark else "unchecked"
+            trademark_risk(_session, domain.split(".", 1)[0]) if check_trademark else "unchecked"
         )
         parking = http_check.parked if http_check else False
         score = compute_priority_score(rdap_status, wayback_status, trademark_status, parking)
@@ -244,8 +254,6 @@ def write_dead_links_to_csv(dead_links: List[DeadLinkEntry], output_path: str) -
 
 
 def _channel_url(row: dict[str, str]) -> str:
-    if row.get("channel_url"):
-        return row["channel_url"]
     return f"https://www.youtube.com/channel/{row['channel_id']}"
 
 
@@ -271,6 +279,8 @@ def main() -> None:
     parser.add_argument("--check-rdap", action="store_true")
     parser.add_argument("--check-wayback", action="store_true")
     parser.add_argument("--check-trademark", action="store_true")
+    parser.add_argument("--max-channel-workers", type=int, default=1,
+                        help="Parallel threads for channel scanning (default: 1 = sequential)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--json-logs", action="store_true")
@@ -292,38 +302,54 @@ def main() -> None:
         rows = list(csv.DictReader(f))
 
     total = len(rows)
-    for idx, row in enumerate(rows, 1):
+    pending = [(idx, row) for idx, row in enumerate(rows, 1) if _channel_url(row) not in processed_channels]
+    start = time.time()
+
+    def scan_one(idx_row: tuple[int, dict]) -> tuple[str, list[DeadLinkEntry]]:
+        idx, row = idx_row
         url = _channel_url(row)
-        if url in processed_channels:
-            LOGGER.info("[%s/%s] Skipping checkpointed channel %s", idx, total, url)
-            continue
         LOGGER.info("[%s/%s] Scanning %s", idx, total, row.get("title") or url)
-        links = process_channel(
-            channel_url=url,
-            top_n_videos=args.top_n_videos,
-            dry_run=args.dry_run,
-            max_dns_workers=args.max_dns_workers,
-            ignore_domains=ignore_domains,
-            allowed_tlds=allowed_tlds,
-            include_domains=include_domains,
-            exclude_domains=exclude_domains,
-            cache=cache,
-            yt_dlp_delay=args.yt_dlp_delay,
-            yt_dlp_retries=args.yt_dlp_retries,
-            channel_timeout=args.channel_timeout,
-            enrich_http=args.enrich_http,
-            check_rdap=args.check_rdap,
-            check_wayback=args.check_wayback,
-            check_trademark=args.check_trademark,
-        )
-        for link in links:
-            pair = (url, link.dead_domain)
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                all_dead_links.append(link)
-        processed_channels.add(url)
-        save_checkpoint(args.checkpoint_file, processed_channels)
-        LOGGER.info("Found %s candidate links", len(links))
+        try:
+            links = process_channel(
+                channel_url=url,
+                top_n_videos=args.top_n_videos,
+                dry_run=args.dry_run,
+                max_dns_workers=args.max_dns_workers,
+                ignore_domains=ignore_domains,
+                allowed_tlds=allowed_tlds,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+                cache=cache,
+                yt_dlp_delay=args.yt_dlp_delay,
+                yt_dlp_retries=args.yt_dlp_retries,
+                channel_timeout=args.channel_timeout,
+                enrich_http=args.enrich_http,
+                check_rdap=args.check_rdap,
+                check_wayback=args.check_wayback,
+                check_trademark=args.check_trademark,
+            )
+        except Exception:
+            LOGGER.exception("Scan failed for %s", row.get("title") or url)
+            links = []
+        LOGGER.info("[%s/%s] Found %s candidate links", idx, total, len(links))
+        return url, links
+
+    try:
+        skipped = total - len(pending)
+        if skipped:
+            LOGGER.info("Skipping %s already-checkpointed channels", skipped)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_channel_workers) as executor:
+            for url, links in executor.map(scan_one, pending):
+                for link in links:
+                    pair = (url, link.dead_domain)
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        all_dead_links.append(link)
+                processed_channels.add(url)
+                save_checkpoint(args.checkpoint_file, processed_channels)
+    finally:
+        cache.close()
 
     write_dead_links_to_csv(all_dead_links, args.output)
     result_rows = [asdict(link) for link in all_dead_links]
@@ -331,8 +357,8 @@ def main() -> None:
         write_json(result_rows, args.json_output)
     if args.report_output:
         write_markdown_report(result_rows, args.report_output, "Cashtube Phase 2 Summary")
-    cache.close()
     LOGGER.info("Wrote %s rows to %s", len(all_dead_links), args.output)
+    LOGGER.info("Phase 2 runtime: %.2fs", time.time() - start)
 
 
 if __name__ == "__main__":

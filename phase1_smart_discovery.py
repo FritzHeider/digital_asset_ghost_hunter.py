@@ -21,6 +21,7 @@ except ImportError:
 
 from cashtube_utils import (
     RateLimiter,
+    YouTubeQuotaError,
     chunked,
     configure_dns_timeout,
     configure_logging,
@@ -86,7 +87,12 @@ def _search_legacy_video_channels(
         if page_token:
             params["pageToken"] = page_token
 
-        data = youtube_get(session, "search", params, rate_limiter=rate_limiter)
+        try:
+            data = youtube_get(session, "search", params, rate_limiter=rate_limiter)
+        except YouTubeQuotaError as exc:
+            LOGGER.warning("Quota exhausted mid-search for %r — stopping pagination: %s", query, exc)
+            break
+
         for item in data.get("items", []):
             channel_id = item.get("snippet", {}).get("channelId")
             if channel_id and channel_id not in seen:
@@ -172,6 +178,7 @@ def _has_recent_upload(
         return published_at if upload_dt >= cutoff else None
 
     # Fallback: search API (costs 100 quota units — avoid when possible)
+    LOGGER.debug("No uploads playlist for channel %s; falling back to Search API (100 quota units)", channel_id)
     published_after = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
     try:
         data = youtube_get(
@@ -278,8 +285,12 @@ def discover_channels(
         )
         for item in data.get("items", []):
             stats = item.get("statistics", {})
-            video_count = int(stats.get("videoCount", 0))
-            view_count = int(stats.get("viewCount", 0))
+            try:
+                video_count = int(stats.get("videoCount") or 0)
+                view_count = int(stats.get("viewCount") or 0)
+            except (TypeError, ValueError):
+                video_count = 0
+                view_count = 0
             if video_count < min_video_count or view_count < min_views:
                 continue
 
@@ -358,6 +369,9 @@ def main() -> None:
             validate_published_before(date_arg)
         except ValueError as exc:
             parser.error(str(exc))
+
+    if args.published_after and args.published_after >= args.published_before:
+        parser.error("--published-after must be earlier than --published-before")
 
     api_key = args.api_key or os.getenv("YOUTUBE_API_KEY")
     if not api_key:

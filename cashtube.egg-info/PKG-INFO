@@ -1,0 +1,244 @@
+Metadata-Version: 2.4
+Name: cashtube
+Version: 0.1.0
+Summary: YouTube legacy-domain discovery pipeline
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: requests>=2.31.0
+Requires-Dist: yt-dlp>=2024.03.10
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: tldextract>=5.1.2
+Requires-Dist: PyYAML>=6.0.1
+Provides-Extra: dev
+Requires-Dist: black>=24.4.0; extra == "dev"
+Requires-Dist: mypy>=1.10.0; extra == "dev"
+Requires-Dist: ruff>=0.5.0; extra == "dev"
+
+# Cashtube — Digital Ghost Asset Hunter
+
+Find expired domains still receiving evergreen traffic from old YouTube content.
+
+---
+
+## What It Does
+
+Cashtube is a two-phase YouTube intelligence pipeline:
+
+**Phase 1** — discovers legacy channels (pre-2016, high view counts, no recent uploads) via the YouTube Data API v3.
+
+**Phase 2** — scans those channels' video descriptions for dead external domains using `yt-dlp` + DNS resolution.
+
+The target: "digital ghost assets" — `.com`, `.io`, `.net` domains that creators linked to years ago (failed startups, defunct sponsors, abandoned SaaS, expired affiliate microsites) that still receive passive SEO traffic from YouTube.
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/FritzHeider/digital_asset_ghost_hunter.py.git
+cd digital_asset_ghost_hunter.py
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Python 3.11+ required.
+
+---
+
+## Environment
+
+```bash
+cp .env .env.local
+# Edit .env.local and set:
+# YOUTUBE_API_KEY=...
+# USPTO_API_KEY=...   (optional, for trademark checks)
+```
+
+Or pass `--api-key` directly on the CLI.
+
+---
+
+## Google Cloud Setup
+
+Enable **YouTube Data API v3** in Google Cloud Console and create an API key.
+
+Default daily quota: **10,000 units**. Phase 1 uses ~1 unit per channel checked (via `playlistItems.list`). Phase 1 keyword searches use ~100 units each — keep `--max-channels` reasonable.
+
+If you get a `403 quotaExceeded` error, your daily quota is exhausted. Wait until midnight Pacific time or request a quota increase.
+
+---
+
+## Usage
+
+### Full pipeline (Phase 1 → Phase 2)
+```bash
+cashtube pipeline \
+    --api-key YOUR_KEY \
+    --published-before 2016-01-01T00:00:00Z \
+    --min-video-count 50 \
+    --max-channels 100 \
+    --top-n-videos 20
+```
+
+### Phase 1 only — discover channels
+```bash
+cashtube phase1 \
+    --api-key YOUR_KEY \
+    --published-before 2016-01-01T00:00:00Z \
+    --min-video-count 50 \
+    --max-channels 100
+```
+
+### Phase 2 only — scan for dead domains
+```bash
+cashtube phase2 \
+    --channels-file phase1_results.csv \
+    --top-n-videos 20
+```
+
+### Ghost Hunter — niche-focused tech/startup graveyard scan
+```bash
+cashtube ghost \
+    --api-key YOUR_KEY \
+    --published-before 2016-01-01T00:00:00Z \
+    --min-views 2000000 \
+    --top-n-videos 20 \
+    --output ghost_results.csv
+```
+
+### Dry run — extract candidates without DNS checks
+```bash
+cashtube pipeline \
+    --api-key YOUR_KEY \
+    --dry-run \
+    --json-logs \
+    --json-output phase2_results.json \
+    --report-output phase2_summary.md
+```
+
+---
+
+## Phase 2 Enrichment
+
+Optional signals can be added to each dead domain candidate:
+
+```bash
+cashtube phase2 \
+    --channels-file phase1_results.csv \
+    --enrich-http \
+    --check-rdap \
+    --check-wayback \
+    --check-trademark \
+    --channel-timeout 120 \
+    --yt-dlp-delay 1 \
+    --yt-dlp-retries 3
+```
+
+Trademark checks require `USPTO_API_KEY` in the environment.
+
+---
+
+## Config Files
+
+Keywords, ignored domains, and allowed TLDs can be loaded from JSON or YAML:
+
+```json
+{
+  "keywords": ["tech review", "unboxing", "kickstarter gadget"],
+  "ignore_domains": ["youtube.com", "amazon.com"],
+  "allowed_tlds": [".com", ".io", ".net"]
+}
+```
+
+```bash
+cashtube pipeline \
+    --api-key YOUR_KEY \
+    --keywords-file cashtube-config.json \
+    --config cashtube-config.json \
+    --cache-ttl-seconds 86400
+```
+
+---
+
+## Outputs
+
+### `phase1_results.csv`
+| Field | Description |
+|---|---|
+| `channel_id` | YouTube channel ID |
+| `title` | Channel name |
+| `view_count` | Total channel views |
+| `video_count` | Number of uploaded videos |
+| `published_at` | Channel creation date |
+| `last_upload` | Most recent upload date (empty = no recent uploads) |
+| `source_keyword` | Search keyword that found the channel |
+
+### `phase2_results.csv`
+| Field | Description |
+|---|---|
+| `channel_url` | Source channel URL |
+| `video_url` | Video where the domain was found |
+| `dead_domain` | Candidate expired domain |
+| `status` | DNS status (`NXDOMAIN`, etc.) |
+| `error_category` | Error classification |
+| `http_status` | HTTP response code (if `--enrich-http`) |
+| `ssl_ok` | SSL valid (if `--enrich-http`) |
+| `parking_detected` | Domain parked/for-sale signal |
+| `availability_signal` | Registrar availability hint |
+| `rdap_status` | RDAP lookup result (if `--check-rdap`) |
+| `wayback_status` | Wayback Machine result (if `--check-wayback`) |
+| `trademark_status` | USPTO risk signal (if `--check-trademark`) |
+| `priority_score` | Composite ROI score |
+| `first_seen_at` | Timestamp of first detection |
+| `source_description_snippet` | Context snippet from video description |
+
+---
+
+## Architecture
+
+| File | Role |
+|---|---|
+| `cashtube/cli.py` | Entry point; dispatches `pipeline`, `phase1`, `phase2`, `ghost` |
+| `cashtube_utils.py` | Shared utilities: HTTP session, DNS, SQLite cache, rate limiter |
+| `phase1_smart_discovery.py` | YouTube API → `ChannelRecord` dataclasses → `phase1_results.csv` |
+| `phase2_dead_link_detection.py` | yt-dlp scraping → `DeadLinkEntry` dataclasses → `phase2_results.csv` |
+| `cashtube_pipeline.py` | Wires Phase 1 → Phase 2 with checkpointing and dedup |
+| `digital_asset_ghost_hunter.py` | Standalone niche-focused variant (tech/startup graveyard) |
+| `trademarked.py` | Trademark risk utilities |
+
+Run state is stored in `.cashtube_channels_seen.json` and `.cashtube_phase2_checkpoint.json` (gitignored) so interrupted runs resume cleanly.
+
+---
+
+## Linting and Tests
+
+```bash
+ruff check .
+black --check .
+mypy .
+python -m pytest tests/
+```
+
+---
+
+## Known Limitations
+
+- **DNS false positives**: `NXDOMAIN` can mean a temporary outage, registrar hold, or geo-DNS issue — not guaranteed availability. Verify with a registrar before acting.
+- **YouTube quota**: Default 10,000 units/day. Large `--max-channels` values will exhaust it.
+- **yt-dlp**: Keep updated (`pip install --upgrade yt-dlp`). YouTube changes break older versions.
+
+---
+
+## Ethical Use
+
+- Analyze public metadata only
+- Verify trademark and legal status before registering any domain
+- Do not attempt CAPTCHA bypass, email harvesting, or registrar abuse
+
+This tool is for research, SEO intelligence, and lawful domain investment only.
+
+---
+
+*The internet forgets surprisingly expensive things. Cashtube finds them.*
