@@ -2,22 +2,21 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import json
 import logging
 import os
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import List, Optional
+from datetime import datetime, timedelta, UTC
 
 import requests
 
 try:
     from dotenv import load_dotenv
 except ImportError:
+
     def load_dotenv() -> None:
         return None
+
 
 from cashtube_utils import (
     RateLimiter,
@@ -90,7 +89,9 @@ def _search_legacy_video_channels(
         try:
             data = youtube_get(session, "search", params, rate_limiter=rate_limiter)
         except YouTubeQuotaError as exc:
-            LOGGER.warning("Quota exhausted mid-search for %r — stopping pagination: %s", query, exc)
+            LOGGER.warning(
+                "Quota exhausted mid-search for %r — stopping pagination: %s", query, exc
+            )
             break
 
         for item in data.get("items", []):
@@ -133,7 +134,7 @@ def _has_recent_upload(
     recent_days: int,
     rate_limiter: RateLimiter | None = None,
     uploads_playlist_id: str | None = None,
-) -> Optional[str]:
+) -> str | None:
     """Return the most recent upload date (ISO string) if the channel uploaded
     within ``recent_days``, or None if it has not.
 
@@ -146,7 +147,7 @@ def _has_recent_upload(
     if recent_days <= 0:
         return None
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
+    cutoff = datetime.now(UTC) - timedelta(days=recent_days)
 
     if uploads_playlist_id:
         try:
@@ -178,7 +179,10 @@ def _has_recent_upload(
         return published_at if upload_dt >= cutoff else None
 
     # Fallback: search API (costs 100 quota units — avoid when possible)
-    LOGGER.debug("No uploads playlist for channel %s; falling back to Search API (100 quota units)", channel_id)
+    LOGGER.debug(
+        "No uploads playlist for channel %s; falling back to Search API (100 quota units)",
+        channel_id,
+    )
     published_after = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
     try:
         data = youtube_get(
@@ -231,7 +235,7 @@ def discover_channels(
     published_after: str | None = None,
     checkpoint_file: str | None = None,
     youtube_delay: float = 0.0,
-) -> List[ChannelRecord]:
+) -> list[ChannelRecord]:
     """Search for legacy videos, then qualify their parent channels.
 
     ``recent_days`` skips channels that uploaded recently; pass 0 to disable.
@@ -241,9 +245,7 @@ def discover_channels(
 
     queries = keyword_list or ([keywords] if keywords else None)
     if not queries:
-        raise ValueError(
-            "At least one keyword is required. Pass --keywords or --keywords-file."
-        )
+        raise ValueError("At least one keyword is required. Pass --keywords or --keywords-file.")
 
     rate_limiter = RateLimiter(youtube_delay)
     seen_channel_ids = load_checkpoint(checkpoint_file)
@@ -295,9 +297,7 @@ def discover_channels(
                 continue
 
             uploads_playlist_id = (
-                item.get("contentDetails", {})
-                .get("relatedPlaylists", {})
-                .get("uploads", "")
+                item.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads", "")
             )
             last_upload = _has_recent_upload(
                 session,
@@ -334,7 +334,7 @@ def discover_channels(
     return sorted(results, key=lambda c: (-c.view_count, c.title.lower(), c.channel_id))
 
 
-def write_channels_to_csv(channels: List[ChannelRecord], output_file: str) -> None:
+def write_channels_to_csv(channels: list[ChannelRecord], output_file: str) -> None:
     fieldnames = [f.name for f in dataclasses.fields(ChannelRecord)]
     write_dicts_to_csv([asdict(channel) for channel in channels], output_file, fieldnames)
 
@@ -344,8 +344,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cashtube Phase 1: Smart Discovery")
     parser.add_argument("--api-key", help="YouTube Data API key")
     parser.add_argument("--published-before", default="2016-01-01T00:00:00Z")
-    parser.add_argument("--published-after", default=None,
-                        help="Narrow to channels created after this ISO-8601 date")
+    parser.add_argument(
+        "--published-after",
+        default=None,
+        help="Narrow to channels created after this ISO-8601 date",
+    )
     parser.add_argument("--min-video-count", type=int, default=50)
     parser.add_argument("--recent-days", type=int, default=180)
     parser.add_argument("--max-channels", type=int, default=100)
@@ -357,8 +360,9 @@ def main() -> None:
     parser.add_argument("--report-output", default=None)
     parser.add_argument("--checkpoint-file", default=".cashtube_channels_seen.json")
     parser.add_argument("--youtube-delay", type=float, default=0.0)
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
     configure_logging(json_logs=args.json_logs, level=args.log_level)

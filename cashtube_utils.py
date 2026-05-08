@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
 import os
@@ -13,10 +12,11 @@ import time
 from collections import Counter
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 from urllib.parse import urlparse
 
 import requests
@@ -33,9 +33,7 @@ DEFAULT_TIMEOUT = 15
 DEFAULT_CACHE_TTL_SECONDS = 86400
 _QUOTA_EXHAUSTED_REASONS = frozenset({"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"})
 
-URL_PATTERN = re.compile(
-    r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F]{2}))+"
-)
+URL_PATTERN = re.compile(r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F]{2}))+")
 
 IGNORE_DOMAINS = {
     "amazon.com",
@@ -88,7 +86,9 @@ class JsonFormatter(logging.Formatter):
 
 def configure_logging(json_logs: bool = False, level: str = "INFO") -> None:
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(JsonFormatter() if json_logs else logging.Formatter("%(levelname)s: %(message)s"))
+    handler.setFormatter(
+        JsonFormatter() if json_logs else logging.Formatter("%(levelname)s: %(message)s")
+    )
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
@@ -206,10 +206,7 @@ def youtube_get(
     if response.status_code == 403:
         try:
             body = response.json()
-            reasons = [
-                e.get("reason", "")
-                for e in body.get("error", {}).get("errors", [])
-            ]
+            reasons = [e.get("reason", "") for e in body.get("error", {}).get("errors", [])]
         except Exception:
             reasons = []
         if _QUOTA_EXHAUSTED_REASONS.intersection(reasons):
@@ -272,14 +269,22 @@ def _tld(domain: str) -> str:
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total_rows": len(rows),
-        "by_tld": dict(Counter(_tld(row.get("dead_domain", "")) for row in rows if row.get("dead_domain"))),
+        "by_tld": dict(
+            Counter(_tld(row.get("dead_domain", "")) for row in rows if row.get("dead_domain"))
+        ),
         "by_dns_status": dict(Counter(row.get("status", "unknown") for row in rows)),
-        "by_channel": dict(Counter(row.get("channel_url") or row.get("channel_id") or "unknown" for row in rows)),
-        "by_keyword": dict(Counter(row.get("source_keyword", "") for row in rows if row.get("source_keyword"))),
+        "by_channel": dict(
+            Counter(row.get("channel_url") or row.get("channel_id") or "unknown" for row in rows)
+        ),
+        "by_keyword": dict(
+            Counter(row.get("source_keyword", "") for row in rows if row.get("source_keyword"))
+        ),
     }
 
 
-def write_markdown_report(rows: list[dict[str, Any]], output_path: str, title: str = "Cashtube Summary") -> None:
+def write_markdown_report(
+    rows: list[dict[str, Any]], output_path: str, title: str = "Cashtube Summary"
+) -> None:
     summary = summarize_rows(rows)
     lines = [f"# {title}", "", f"- Total rows: {summary['total_rows']}"]
     for section, values in (
@@ -424,7 +429,7 @@ def classify_domain(domain: str, timeout: float = 5.0) -> DomainCheck:
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -446,7 +451,9 @@ PARKING_MARKERS = (
 )
 
 
-def check_http_domain(session: requests.Session, domain: str, timeout: int = DEFAULT_TIMEOUT) -> HttpCheck:
+def check_http_domain(
+    session: requests.Session, domain: str, timeout: int = DEFAULT_TIMEOUT
+) -> HttpCheck:
     for scheme in ("https", "http"):
         try:
             response = session.get(f"{scheme}://{domain}", timeout=timeout, allow_redirects=True)
@@ -517,15 +524,14 @@ def trademark_risk(session: requests.Session, word: str, timeout: int = DEFAULT_
 # Checkpoint helpers (shared by pipeline and phase2 standalone)
 # ---------------------------------------------------------------------------
 
+
 def load_checkpoint(path: str | None) -> set[str]:
     if not path or not Path(path).exists():
         return set()
     try:
         return set(json.loads(Path(path).read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError):
-        logging.getLogger(__name__).warning(
-            "Could not read checkpoint %s; starting fresh", path
-        )
+        logging.getLogger(__name__).warning("Could not read checkpoint %s; starting fresh", path)
         return set()
 
 
@@ -537,6 +543,7 @@ def save_checkpoint(path: str | None, items: set[str]) -> None:
 # ---------------------------------------------------------------------------
 # Priority scoring
 # ---------------------------------------------------------------------------
+
 
 def compute_priority_score(
     rdap_status: str,

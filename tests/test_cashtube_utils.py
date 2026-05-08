@@ -63,7 +63,8 @@ class RateLimiterTest(unittest.TestCase):
         for i in range(1, len(call_times)):
             gap = call_times[i] - call_times[i - 1]
             self.assertGreaterEqual(
-                gap, 0.03,
+                gap,
+                0.03,
                 f"Thread {i} fired too soon ({gap:.3f}s after previous); RateLimiter not thread-safe",
             )
 

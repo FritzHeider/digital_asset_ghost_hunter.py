@@ -9,15 +9,17 @@ import time
 try:
     from dotenv import load_dotenv
 except ImportError:
+
     def load_dotenv() -> None:
         return None
+
 
 from cashtube_utils import (
     configure_dns_timeout,
     configure_logging,
     validate_published_before,
 )
-from phase1_smart_discovery import discover_channels, write_channels_to_csv
+from phase1_smart_discovery import discover_channels
 from phase2_dead_link_detection import DeadLinkEntry, process_channel
 
 LOGGER = logging.getLogger(__name__)
@@ -40,13 +42,18 @@ def main() -> None:
     parser.add_argument("--published-before", default="2016-01-01T00:00:00Z")
     parser.add_argument("--min-views", type=int, default=2_000_000)
     parser.add_argument("--min-video-count", type=int, default=50)
-    parser.add_argument("--recent-days", type=int, default=180,
-                        help="Skip channels with uploads within this many days (0=keep all)")
+    parser.add_argument(
+        "--recent-days",
+        type=int,
+        default=180,
+        help="Skip channels with uploads within this many days (0=keep all)",
+    )
     parser.add_argument("--top-n-videos", type=int, default=20)
     parser.add_argument("--max-channels", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     parser.add_argument("--json-logs", action="store_true")
     parser.add_argument("--output", default="ghost_results.csv")
     args = parser.parse_args()
@@ -97,13 +104,17 @@ def main() -> None:
                     "source_description_snippet": entry.source_description_snippet,
                 }
             )
-            LOGGER.info("Ghost domain found: %s (score %s)", entry.dead_domain, entry.priority_score)
+            LOGGER.info(
+                "Ghost domain found: %s (score %s)", entry.dead_domain, entry.priority_score
+            )
 
-    all_results.sort(key=lambda row: (
-        -row["priority_score"],
-        row["channel_id"],
-        row["dead_domain"],
-    ))
+    all_results.sort(
+        key=lambda row: (
+            -row["priority_score"],
+            row["channel_id"],
+            row["dead_domain"],
+        )
+    )
 
     fieldnames = [
         "channel_id",

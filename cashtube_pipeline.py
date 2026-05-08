@@ -5,13 +5,14 @@ import concurrent.futures
 import logging
 import os
 from dataclasses import asdict
-from typing import List
 
 try:
     from dotenv import load_dotenv
 except ImportError:
+
     def load_dotenv() -> None:
         return None
+
 
 from cashtube_utils import (
     SQLiteCache,
@@ -106,7 +107,9 @@ def run_pipeline(
     allowed_tlds = normalize_tlds((phase2_config or {}).get("allowed_tlds", [])) or None
     cache = SQLiteCache(cache_db, cache_ttl_seconds)
     processed_channels = load_checkpoint(scan_checkpoint_file)
-    enrich_session = make_session() if (enrich_http or check_rdap or check_wayback or check_trademark) else None
+    enrich_session = (
+        make_session() if (enrich_http or check_rdap or check_wayback or check_trademark) else None
+    )
 
     all_dead_links: list[DeadLinkEntry] = []
     seen_pairs: set[tuple[str, str]] = set()
@@ -164,7 +167,9 @@ def run_pipeline(
     if report_output:
         write_markdown_report(rows, report_output, "Cashtube Pipeline Summary")
     cache.close()
-    LOGGER.info("Pipeline complete: %s total rows saved to %s", len(all_dead_links), dead_links_output)
+    LOGGER.info(
+        "Pipeline complete: %s total rows saved to %s", len(all_dead_links), dead_links_output
+    )
 
 
 def main() -> None:
@@ -172,8 +177,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cashtube Full Pipeline")
     parser.add_argument("--api-key", help="YouTube Data API key")
     parser.add_argument("--published-before", default="2016-01-01T00:00:00Z")
-    parser.add_argument("--published-after", default=None,
-                        help="Narrow to channels created after this ISO-8601 date")
+    parser.add_argument(
+        "--published-after",
+        default=None,
+        help="Narrow to channels created after this ISO-8601 date",
+    )
     parser.add_argument("--min-video-count", type=int, default=50)
     parser.add_argument("--recent-days", type=int, default=180)
     parser.add_argument("--max-channels", type=int, default=100)
@@ -196,15 +204,20 @@ def main() -> None:
     parser.add_argument("--yt-dlp-delay", type=float, default=0.0)
     parser.add_argument("--yt-dlp-retries", type=int, default=3)
     parser.add_argument("--channel-timeout", type=float, default=None)
-    parser.add_argument("--max-channel-workers", type=int, default=4,
-                        help="Parallel threads for Phase 2 channel scanning")
+    parser.add_argument(
+        "--max-channel-workers",
+        type=int,
+        default=4,
+        help="Parallel threads for Phase 2 channel scanning",
+    )
     parser.add_argument("--enrich-http", action="store_true")
     parser.add_argument("--check-rdap", action="store_true")
     parser.add_argument("--check-wayback", action="store_true")
     parser.add_argument("--check-trademark", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
     configure_logging(json_logs=args.json_logs, level=args.log_level)

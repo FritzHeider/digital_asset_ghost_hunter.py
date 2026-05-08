@@ -4,13 +4,10 @@ import argparse
 import concurrent.futures
 import csv
 import dataclasses
-import json
 import logging
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from types import SimpleNamespace
-from typing import List
 
 from cashtube_utils import (
     DnsStatus,
@@ -87,21 +84,42 @@ def process_channel(
     check_wayback: bool = False,
     check_trademark: bool = False,
     session: requests.Session | None = None,
-) -> List[DeadLinkEntry]:
+) -> list[DeadLinkEntry]:
     """Scrape top video descriptions and return dead-domain candidates."""
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("Install yt-dlp before scanning channels: pip install -r requirements.txt") from exc
+        raise RuntimeError(
+            "Install yt-dlp before scanning channels: pip install -r requirements.txt"
+        ) from exc
 
     discovered: dict[str, dict[str, str]] = {}
     deadline = time.monotonic() + channel_timeout if channel_timeout else None
+
+    class _YtdlpLogger:
+        """Route yt-dlp messages through our logger at appropriate levels."""
+
+        def debug(self, msg: str) -> None:
+            if msg.startswith("[debug]"):
+                LOGGER.debug("%s", msg)
+
+        def info(self, msg: str) -> None:
+            LOGGER.debug("%s", msg)
+
+        def warning(self, msg: str) -> None:
+            LOGGER.debug("%s", msg)
+
+        def error(self, msg: str) -> None:
+            LOGGER.debug("%s", msg)
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
-        "logger": None,
+        "logger": _YtdlpLogger(),
+        "retries": 0,
+        "fragment_retries": 0,
     }
 
     def timed_out() -> bool:
@@ -128,8 +146,15 @@ def process_channel(
             except TimeoutError:
                 raise
             except yt_dlp.utils.ExtractorError as exc:
-                if exc.expected:
-                    raise  # permanent error (unavailable, age-restricted, etc.) — don't retry
+                _msg = str(exc).lower()
+                if (
+                    exc.expected
+                    or "not available" in _msg
+                    or "sign in" in _msg
+                    or "age" in _msg
+                    or "private" in _msg
+                ):
+                    raise  # permanent error — don't retry
                 last_exc = exc
                 time.sleep(min(2**attempt, 8))
             except Exception as exc:
@@ -164,7 +189,10 @@ def process_channel(
                         continue
                     if exclude_domains and domain in exclude_domains:
                         continue
-                    if is_interesting_domain(domain, ignore_domains, allowed_tlds) and domain not in discovered:
+                    if (
+                        is_interesting_domain(domain, ignore_domains, allowed_tlds)
+                        and domain not in discovered
+                    ):
                         discovered[domain] = {
                             "video_url": video_url,
                             "source_description_snippet": _snippet(description, url),
@@ -247,7 +275,7 @@ def process_channel(
     return results
 
 
-def write_dead_links_to_csv(dead_links: List[DeadLinkEntry], output_path: str) -> None:
+def write_dead_links_to_csv(dead_links: list[DeadLinkEntry], output_path: str) -> None:
     fieldnames = [f.name for f in dataclasses.fields(DeadLinkEntry)]
     rows = sorted(dead_links, key=lambda item: (item.channel_url, item.dead_domain, item.video_url))
     write_dicts_to_csv([asdict(link) for link in rows], output_path, fieldnames)
@@ -279,10 +307,15 @@ def main() -> None:
     parser.add_argument("--check-rdap", action="store_true")
     parser.add_argument("--check-wayback", action="store_true")
     parser.add_argument("--check-trademark", action="store_true")
-    parser.add_argument("--max-channel-workers", type=int, default=1,
-                        help="Parallel threads for channel scanning (default: 1 = sequential)")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--max-channel-workers",
+        type=int,
+        default=1,
+        help="Parallel threads for channel scanning (default: 1 = sequential)",
+    )
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     parser.add_argument("--json-logs", action="store_true")
     args = parser.parse_args()
     configure_logging(json_logs=args.json_logs, level=args.log_level)
@@ -302,7 +335,9 @@ def main() -> None:
         rows = list(csv.DictReader(f))
 
     total = len(rows)
-    pending = [(idx, row) for idx, row in enumerate(rows, 1) if _channel_url(row) not in processed_channels]
+    pending = [
+        (idx, row) for idx, row in enumerate(rows, 1) if _channel_url(row) not in processed_channels
+    ]
     start = time.time()
 
     def scan_one(idx_row: tuple[int, dict]) -> tuple[str, list[DeadLinkEntry]]:
@@ -339,7 +374,9 @@ def main() -> None:
         if skipped:
             LOGGER.info("Skipping %s already-checkpointed channels", skipped)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_channel_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.max_channel_workers
+        ) as executor:
             for url, links in executor.map(scan_one, pending):
                 for link in links:
                     pair = (url, link.dead_domain)

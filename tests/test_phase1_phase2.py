@@ -77,9 +77,7 @@ class Phase1PaginationTest(unittest.TestCase):
 
     def test_recent_upload_returns_date_when_found(self) -> None:
         """A channel with a recent upload returns the publishedAt date."""
-        response_data = {
-            "items": [{"snippet": {"publishedAt": "2025-01-15T10:00:00Z"}}]
-        }
+        response_data = {"items": [{"snippet": {"publishedAt": "2025-01-15T10:00:00Z"}}]}
         with mock.patch("phase1_smart_discovery.youtube_get", return_value=response_data):
             result = phase1_smart_discovery._has_recent_upload(
                 mock.Mock(),
@@ -102,6 +100,7 @@ class Phase1PaginationTest(unittest.TestCase):
     def test_search_quota_error_logs_warning_and_returns_partial(self) -> None:
         page1 = {"items": [{"snippet": {"channelId": "ch1"}}], "nextPageToken": "tok"}
         from cashtube_utils import YouTubeQuotaError
+
         responses = [page1, YouTubeQuotaError("quota")]
 
         def side_effect(*args, **kwargs):

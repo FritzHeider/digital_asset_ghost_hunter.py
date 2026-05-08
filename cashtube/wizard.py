@@ -7,14 +7,15 @@ import logging
 import os
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 try:
     from dotenv import load_dotenv
 except ImportError:
+
     def load_dotenv() -> None:
         return None
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ def _ask_int(prompt: str, default: int) -> int:
         try:
             return int(raw)
         except ValueError:
-            print(f"    Please enter a whole number.")
+            print("    Please enter a whole number.")
 
 
 def _ask_bool(prompt: str, default: bool = False) -> bool:
@@ -94,7 +95,7 @@ def run() -> None:
     # ── API key ──────────────────────────────────────────────────────────────
     env_key = os.getenv("YOUTUBE_API_KEY", "")
     if env_key:
-        print(f"  YouTube API key loaded from environment.")
+        print("  YouTube API key loaded from environment.")
         api_key = env_key
     else:
         print("  YouTube API key")
@@ -106,12 +107,14 @@ def run() -> None:
 
     # ── Mode ─────────────────────────────────────────────────────────────────
     print("\n  What do you want to run?")
-    mode = _choose([
-        ("pipeline", "Full pipeline  — Phase 1 discovery → Phase 2 dead-link scan"),
-        ("phase1",   "Phase 1 only   — find legacy channels, write phase1_results.csv"),
-        ("phase2",   "Phase 2 only   — scan an existing channels CSV for dead links"),
-        ("ghost",    "Ghost hunter   — high-view tech/startup niche (preset keywords)"),
-    ])
+    mode = _choose(
+        [
+            ("pipeline", "Full pipeline  — Phase 1 discovery → Phase 2 dead-link scan"),
+            ("phase1", "Phase 1 only   — find legacy channels, write phase1_results.csv"),
+            ("phase2", "Phase 2 only   — scan an existing channels CSV for dead links"),
+            ("ghost", "Ghost hunter   — high-view tech/startup niche (preset keywords)"),
+        ]
+    )
 
     # ── Channels file (phase2 only) ───────────────────────────────────────────
     channels_file = "phase1_results.csv"
@@ -125,8 +128,9 @@ def run() -> None:
     keywords: list[str] = []
     if mode == "ghost":
         from digital_asset_ghost_hunter import GHOST_KEYWORDS
+
         keywords = list(GHOST_KEYWORDS)
-        print(f"\n  Ghost hunter uses preset keywords:")
+        print("\n  Ghost hunter uses preset keywords:")
         for kw in keywords:
             print(f"    • {kw}")
         if _ask_bool("  Customise keywords?", False):
@@ -149,23 +153,23 @@ def run() -> None:
     if mode not in ("phase2",):
         print("\n  Channel quality filters")
         min_video_count = _ask_int("Min video count", 50)
-        min_views       = _ask_int("Min total views (0 = no minimum)", 0)
-        max_channels    = _ask_int("Max channels to qualify", 100)
-        recent_days     = _ask_int("Ignore channels active within N days (0 = keep all)", 180)
+        min_views = _ask_int("Min total views (0 = no minimum)", 0)
+        max_channels = _ask_int("Max channels to qualify", 100)
+        recent_days = _ask_int("Ignore channels active within N days (0 = keep all)", 180)
 
     # ── Scan settings ─────────────────────────────────────────────────────────
     top_n_videos = 20
-    enrich_http  = False
-    check_rdap   = False
+    enrich_http = False
+    check_rdap = False
     check_wayback = False
     max_dns_workers = 10
     if mode != "phase1":
         print("\n  Scan settings")
-        top_n_videos    = _ask_int("Videos to scan per channel", 20)
+        top_n_videos = _ask_int("Videos to scan per channel", 20)
         max_dns_workers = _ask_int("Parallel DNS workers", 10)
         print("  Enrichment  (each flag costs extra HTTP calls per dead domain)")
-        enrich_http   = _ask_bool("  HTTP reachability / parking check?", False)
-        check_rdap    = _ask_bool("  RDAP domain availability check?", False)
+        enrich_http = _ask_bool("  HTTP reachability / parking check?", False)
+        check_rdap = _ask_bool("  RDAP domain availability check?", False)
         check_wayback = _ask_bool("  Wayback Machine snapshot check?", False)
 
     # ── Misc ──────────────────────────────────────────────────────────────────
@@ -181,12 +185,18 @@ def run() -> None:
     if mode != "phase2":
         print(f"  Keywords        {', '.join(keywords)}")
         print(f"  Published before {published_before}")
-        print(f"  Max channels    {max_channels}  (min {min_video_count} vids, min {min_views:,} views)")
+        print(
+            f"  Max channels    {max_channels}  (min {min_video_count} vids, min {min_views:,} views)"
+        )
         print(f"  Recent days     {recent_days}")
     else:
         print(f"  Channels file   {channels_file}")
     if mode != "phase1":
-        enrichment = [x for x, flag in [("HTTP", enrich_http), ("RDAP", check_rdap), ("Wayback", check_wayback)] if flag]
+        enrichment = [
+            x
+            for x, flag in [("HTTP", enrich_http), ("RDAP", check_rdap), ("Wayback", check_wayback)]
+            if flag
+        ]
         print(f"  Videos/channel  {top_n_videos}  DNS workers: {max_dns_workers}")
         print(f"  Enrichment      {', '.join(enrichment) or 'none'}")
     if dry_run:
@@ -203,15 +213,28 @@ def run() -> None:
         Path(kw_file).write_text(json.dumps({"keywords": keywords}, indent=2) + "\n")
 
     cmd = _build_command(
-        mode, kw_file if (keywords and mode != "phase2") else None, api_key,
-        published_before, min_video_count, min_views, max_channels, recent_days,
-        top_n_videos, max_dns_workers, enrich_http, check_rdap, check_wayback,
-        dry_run, log_level, channels_file,
+        mode,
+        kw_file if (keywords and mode != "phase2") else None,
+        api_key,
+        published_before,
+        min_video_count,
+        min_views,
+        max_channels,
+        recent_days,
+        top_n_videos,
+        max_dns_workers,
+        enrich_http,
+        check_rdap,
+        check_wayback,
+        dry_run,
+        log_level,
+        channels_file,
     )
     print(f"\n  Equivalent command:\n    {cmd}\n")
 
     # ── Execute ───────────────────────────────────────────────────────────────
     from cashtube_utils import configure_logging, configure_dns_timeout
+
     configure_logging(level=log_level)
     configure_dns_timeout()
 
@@ -219,24 +242,51 @@ def run() -> None:
 
     if mode == "pipeline":
         _run_pipeline(
-            api_key, keywords, published_before, min_video_count, min_views,
-            max_channels, recent_days, top_n_videos, max_dns_workers,
-            enrich_http, check_rdap, check_wayback, dry_run,
+            api_key,
+            keywords,
+            published_before,
+            min_video_count,
+            min_views,
+            max_channels,
+            recent_days,
+            top_n_videos,
+            max_dns_workers,
+            enrich_http,
+            check_rdap,
+            check_wayback,
+            dry_run,
         )
     elif mode == "phase1":
         _run_phase1(
-            api_key, keywords, published_before, min_video_count, min_views,
-            max_channels, recent_days,
+            api_key,
+            keywords,
+            published_before,
+            min_video_count,
+            min_views,
+            max_channels,
+            recent_days,
         )
     elif mode == "phase2":
         _run_phase2(
-            channels_file, top_n_videos, max_dns_workers,
-            enrich_http, check_rdap, check_wayback, dry_run,
+            channels_file,
+            top_n_videos,
+            max_dns_workers,
+            enrich_http,
+            check_rdap,
+            check_wayback,
+            dry_run,
         )
     elif mode == "ghost":
         _run_ghost(
-            api_key, keywords, published_before, min_video_count, min_views,
-            max_channels, recent_days, top_n_videos, dry_run,
+            api_key,
+            keywords,
+            published_before,
+            min_video_count,
+            min_views,
+            max_channels,
+            recent_days,
+            top_n_videos,
+            dry_run,
         )
 
     print(f"\n  Done in {time.time() - start:.1f}s")
@@ -244,13 +294,24 @@ def run() -> None:
 
 # ── Runners ───────────────────────────────────────────────────────────────────
 
+
 def _run_pipeline(
-    api_key: str, keywords: list[str], published_before: str,
-    min_video_count: int, min_views: int, max_channels: int, recent_days: int,
-    top_n_videos: int, max_dns_workers: int,
-    enrich_http: bool, check_rdap: bool, check_wayback: bool, dry_run: bool,
+    api_key: str,
+    keywords: list[str],
+    published_before: str,
+    min_video_count: int,
+    min_views: int,
+    max_channels: int,
+    recent_days: int,
+    top_n_videos: int,
+    max_dns_workers: int,
+    enrich_http: bool,
+    check_rdap: bool,
+    check_wayback: bool,
+    dry_run: bool,
 ) -> None:
     from cashtube_pipeline import run_pipeline
+
     run_pipeline(
         api_key=api_key,
         published_before=published_before,
@@ -270,10 +331,16 @@ def _run_pipeline(
 
 
 def _run_phase1(
-    api_key: str, keywords: list[str], published_before: str,
-    min_video_count: int, min_views: int, max_channels: int, recent_days: int,
+    api_key: str,
+    keywords: list[str],
+    published_before: str,
+    min_video_count: int,
+    min_views: int,
+    max_channels: int,
+    recent_days: int,
 ) -> None:
     from phase1_smart_discovery import discover_channels, write_channels_to_csv
+
     channels = discover_channels(
         api_key=api_key,
         published_before=published_before,
@@ -289,15 +356,22 @@ def _run_phase1(
 
 
 def _run_phase2(
-    channels_file: str, top_n_videos: int, max_dns_workers: int,
-    enrich_http: bool, check_rdap: bool, check_wayback: bool, dry_run: bool,
+    channels_file: str,
+    top_n_videos: int,
+    max_dns_workers: int,
+    enrich_http: bool,
+    check_rdap: bool,
+    check_wayback: bool,
+    dry_run: bool,
 ) -> None:
     import csv
     import concurrent.futures
-    from dataclasses import asdict
     from cashtube_utils import SQLiteCache, load_checkpoint, save_checkpoint, make_session
     from phase2_dead_link_detection import (
-        DeadLinkEntry, _channel_url, process_channel, write_dead_links_to_csv,
+        DeadLinkEntry,
+        _channel_url,
+        process_channel,
+        write_dead_links_to_csv,
     )
 
     cache = SQLiteCache(".cashtube_cache.sqlite3")
@@ -351,9 +425,15 @@ def _run_phase2(
 
 
 def _run_ghost(
-    api_key: str, keywords: list[str], published_before: str,
-    min_video_count: int, min_views: int, max_channels: int, recent_days: int,
-    top_n_videos: int, dry_run: bool,
+    api_key: str,
+    keywords: list[str],
+    published_before: str,
+    min_video_count: int,
+    min_views: int,
+    max_channels: int,
+    recent_days: int,
+    top_n_videos: int,
+    dry_run: bool,
 ) -> None:
     import csv
     from phase1_smart_discovery import discover_channels
@@ -375,25 +455,37 @@ def _run_ghost(
         LOGGER.info("[%s/%s] Scanning %s", idx, len(channels), channel.title)
         url = f"https://www.youtube.com/channel/{channel.channel_id}"
         entries: list[DeadLinkEntry] = process_channel(
-            channel_url=url, top_n_videos=top_n_videos, dry_run=dry_run,
+            channel_url=url,
+            top_n_videos=top_n_videos,
+            dry_run=dry_run,
         )
         for entry in entries:
-            all_results.append({
-                "channel_id": channel.channel_id,
-                "channel_title": channel.title,
-                "view_count": channel.view_count,
-                "video_url": entry.video_url,
-                "dead_domain": entry.dead_domain,
-                "status": entry.status,
-                "priority_score": entry.priority_score,
-                "first_seen_at": entry.first_seen_at,
-                "source_description_snippet": entry.source_description_snippet,
-            })
+            all_results.append(
+                {
+                    "channel_id": channel.channel_id,
+                    "channel_title": channel.title,
+                    "view_count": channel.view_count,
+                    "video_url": entry.video_url,
+                    "dead_domain": entry.dead_domain,
+                    "status": entry.status,
+                    "priority_score": entry.priority_score,
+                    "first_seen_at": entry.first_seen_at,
+                    "source_description_snippet": entry.source_description_snippet,
+                }
+            )
 
     all_results.sort(key=lambda r: (-r["priority_score"], r["channel_id"], r["dead_domain"]))
-    fieldnames = ["channel_id", "channel_title", "view_count", "video_url",
-                  "dead_domain", "status", "priority_score", "first_seen_at",
-                  "source_description_snippet"]
+    fieldnames = [
+        "channel_id",
+        "channel_title",
+        "view_count",
+        "video_url",
+        "dead_domain",
+        "status",
+        "priority_score",
+        "first_seen_at",
+        "source_description_snippet",
+    ]
     with open("ghost_results.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -403,30 +495,46 @@ def _run_ghost(
 
 # ── Command builder (for display only) ───────────────────────────────────────
 
+
 def _build_command(
-    mode: str, kw_file: str | None, api_key: str,
-    published_before: str, min_video_count: int, min_views: int,
-    max_channels: int, recent_days: int, top_n_videos: int, max_dns_workers: int,
-    enrich_http: bool, check_rdap: bool, check_wayback: bool,
-    dry_run: bool, log_level: str, channels_file: str,
+    mode: str,
+    kw_file: str | None,
+    api_key: str,
+    published_before: str,
+    min_video_count: int,
+    min_views: int,
+    max_channels: int,
+    recent_days: int,
+    top_n_videos: int,
+    max_dns_workers: int,
+    enrich_http: bool,
+    check_rdap: bool,
+    check_wayback: bool,
+    dry_run: bool,
+    log_level: str,
+    channels_file: str,
 ) -> str:
     parts = [f"cashtube {mode}"]
     if mode != "phase2":
-        parts += [f"--api-key $YOUTUBE_API_KEY"]
+        parts += ["--api-key $YOUTUBE_API_KEY"]
     if kw_file:
         parts += [f"--keywords-file {kw_file}"]
     if mode != "phase2":
         parts += [f"--published-before {published_before}"]
     if mode not in ("phase2", "ghost"):
-        parts += [f"--min-video-count {min_video_count}",
-                  f"--min-views {min_views}",
-                  f"--max-channels {max_channels}",
-                  f"--recent-days {recent_days}"]
+        parts += [
+            f"--min-video-count {min_video_count}",
+            f"--min-views {min_views}",
+            f"--max-channels {max_channels}",
+            f"--recent-days {recent_days}",
+        ]
     elif mode == "ghost":
-        parts += [f"--min-video-count {min_video_count}",
-                  f"--min-views {min_views}",
-                  f"--max-channels {max_channels}",
-                  f"--recent-days {recent_days}"]
+        parts += [
+            f"--min-video-count {min_video_count}",
+            f"--min-views {min_views}",
+            f"--max-channels {max_channels}",
+            f"--recent-days {recent_days}",
+        ]
     if mode == "phase2":
         parts += [f"--channels-file {channels_file}"]
     if mode != "phase1":
