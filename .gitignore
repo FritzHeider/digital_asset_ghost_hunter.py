@@ -2,4 +2,5 @@
 .env
 __pycache__/
 ghost_results.csv
-*.csv
+*.csv.cashtube_cache.sqlite3
+*.sqlite3
